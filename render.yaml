@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: usdt-blacklist-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python listener.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: TRONGRID_API_KEY
+        sync: false
