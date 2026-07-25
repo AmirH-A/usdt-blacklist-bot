@@ -35,6 +35,7 @@ ETH_BLACKLIST_TOPIC = (
 )
 
 MAX_ALERTS_PER_CYCLE = 5
+WHALE_THRESHOLD = 100_000  # Alert as whale if balance > $100k
 
 USDT_CONTRACT = TRON_USDT_CONTRACT
 
@@ -106,6 +107,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS sync_state (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+    """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS watchlist (
+            chat_id INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            chain TEXT NOT NULL,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (chat_id, address, chain)
         )
     """
     )
@@ -410,11 +422,15 @@ async def start_cmd(message: Message):
         f"Subscribed to blacklist alerts.\n\n"
         "*Alerts:*\n"
         "PENDING - Blacklist tx detected (unconfirmed)\n"
-        "BLOCKED - Address officially frozen\n\n"
+        "BLOCKED - Address officially frozen\n"
+        "WHALE - Large balance (>$100k) blocked\n\n"
         "*Commands:*\n"
         "/check <address> - Check address status\n"
-        "  Supports TRON (T...) and ETH (0x...)\n"
+        "/watch <address> - Watch specific address\n"
+        "/unwatch <address> - Stop watching\n"
+        "/watchlist - Your watched addresses\n"
         "/recent - Recent blacklist events\n"
+        "/whales - Recent large blocks\n"
         "/stats - Statistics\n"
         "/timing - Confirmation timing stats\n"
         "/stop - Unsubscribe",
@@ -632,6 +648,142 @@ async def timing_cmd(message: Message):
     await message.answer(msg, parse_mode="Markdown")
 
 
+@router.message(Command("watch"))
+async def watch_cmd(message: Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Usage: /watch <address>")
+        return
+
+    address = args[1].strip()
+    chain = detect_chain(address)
+
+    if not chain:
+        await message.answer("Invalid address format.")
+        return
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR IGNORE INTO watchlist (chat_id, address, chain) VALUES (?, ?, ?)",
+        (message.chat.id, address, chain)
+    )
+    conn.commit()
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM watchlist WHERE chat_id = ?", (message.chat.id,)
+    )
+    count = cursor.fetchone()[0]
+    conn.close()
+
+    await message.answer(
+        f"*Address Added to Watchlist*\n\n"
+        f"Chain: {chain}\n"
+        f"Address: `{address}`\n\n"
+        f"You will receive an instant alert if this address gets blacklisted.\n"
+        f"Total watched: {count}",
+        parse_mode="Markdown"
+    )
+
+
+@router.message(Command("unwatch"))
+async def unwatch_cmd(message: Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Usage: /unwatch <address>")
+        return
+
+    address = args[1].strip()
+    chain = detect_chain(address)
+
+    if not chain:
+        await message.answer("Invalid address format.")
+        return
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM watchlist WHERE chat_id = ? AND address = ? AND chain = ?",
+        (message.chat.id, address, chain)
+    )
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+
+    if deleted:
+        await message.answer(f"Removed `{address}` from watchlist.", parse_mode="Markdown")
+    else:
+        await message.answer("Address not found in your watchlist.")
+
+
+@router.message(Command("watchlist"))
+async def watchlist_cmd(message: Message):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT address, chain, added_at FROM watchlist WHERE chat_id = ? ORDER BY added_at DESC",
+        (message.chat.id,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("Your watchlist is empty.\nUse /watch <address> to add addresses.")
+        return
+
+    msg = "*Your Watchlist*\n\n"
+    for addr, chain, added in rows:
+        msg += f"[{chain}] `{addr[:16]}...{addr[-6:]}`\n"
+
+    msg += f"\nTotal: {len(rows)} addresses"
+    await message.answer(msg, parse_mode="Markdown")
+
+
+@router.message(Command("whales"))
+async def whales_cmd(message: Message):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT address, chain, status, detected_at, tx_hash FROM blacklist
+        WHERE status = 'confirmed'
+        ORDER BY detected_at DESC LIMIT 50
+        """
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("No blocked addresses found.")
+        return
+
+    whales = []
+    for addr, chain, status, detected, tx_hash in rows:
+        if chain == "ETH":
+            balance = await get_eth_usdt_balance(addr)
+        else:
+            balance = await get_tron_usdt_balance(addr)
+
+        if balance and balance >= WHALE_THRESHOLD:
+            whales.append((addr, chain, balance, detected))
+
+        if len(whales) >= 10:
+            break
+
+    if not whales:
+        await message.answer("No whale blocks (>$100k) found in recent history.")
+        return
+
+    msg = "*Recent Whale Blocks (>$100k)*\n\n"
+    for addr, chain, balance, detected in whales:
+        balance_text = format_usdt_balance(balance)
+        msg += f"[{chain}] *{balance_text}*\n"
+        msg += f"`{addr[:16]}...{addr[-6:]}`\n"
+        msg += f"{detected[:16]}\n\n"
+
+    await message.answer(msg, parse_mode="Markdown")
+
+
 dp.include_router(router)
 
 
@@ -665,6 +817,13 @@ async def broadcast_alert(
     cursor.execute("SELECT chat_id FROM subscribers")
     subscribers = cursor.fetchall()
 
+    # Get watchlist subscribers for this address
+    cursor.execute(
+        "SELECT chat_id FROM watchlist WHERE address = ? AND chain = ?",
+        (address, chain)
+    )
+    watchlist_subscribers = cursor.fetchall()
+
     avg_confirm_time = None
     if chain == "TRON":
         cursor.execute(
@@ -695,10 +854,6 @@ async def broadcast_alert(
 
     conn.close()
 
-    if not subscribers:
-        logger.info(f"No subscribers for {address}")
-        return
-
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     if chain == "ETH":
@@ -709,9 +864,12 @@ async def broadcast_alert(
         explorer_name = "Tronscan"
 
     balance_text = format_usdt_balance(balance)
+    is_whale = balance is not None and balance >= WHALE_THRESHOLD
 
+    # Build message based on status
     if status == "pending":
-        title = f"⚠️ PENDING BLOCK DETECTED [{chain}]"
+        whale_tag = " [WHALE]" if is_whale else ""
+        title = f"PENDING BLOCK DETECTED [{chain}]{whale_tag}"
         msg = f"*{title}*\n\n"
         msg += f"Chain: {chain}\n"
         msg += f"Address:\n`{address}`\n\n"
@@ -722,8 +880,9 @@ async def broadcast_alert(
         msg += f"\nBlacklist transaction submitted, awaiting confirmation.\n\n"
         msg += f"[View TX on {explorer_name}]({explorer_link})"
     else:
+        whale_tag = " [WHALE]" if is_whale else ""
         if is_update:
-            title = f"🔒 BLOCK CONFIRMED [{chain}]"
+            title = f"BLOCK CONFIRMED [{chain}]{whale_tag}"
             msg = f"*{title}*\n\n"
             msg += f"Chain: {chain}\n"
             msg += f"Address:\n`{address}`\n\n"
@@ -731,19 +890,32 @@ async def broadcast_alert(
             msg += f"Confirmed at: {now_str}\n"
             if elapsed_seconds is not None:
                 msg += f"Time to confirm: *{format_elapsed_time(elapsed_seconds)}*\n"
-            msg += f"\n🚫 Address officially blacklisted by Tether.\n"
+            msg += f"\nAddress officially blacklisted by Tether.\n"
             msg += f"USDT transfers are now frozen.\n\n"
             msg += f"[View TX on {explorer_name}]({explorer_link})"
         else:
-            title = f"🔒 ADDRESS BLOCKED [{chain}]"
+            title = f"ADDRESS BLOCKED [{chain}]{whale_tag}"
             msg = f"*{title}*\n\n"
             msg += f"Chain: {chain}\n"
             msg += f"Address:\n`{address}`\n\n"
             msg += f"Balance frozen: *{balance_text}*\n"
             msg += f"Blocked at: {now_str}\n"
-            msg += f"\n🚫 Address officially blacklisted by Tether.\n"
+            msg += f"\nAddress officially blacklisted by Tether.\n"
             msg += f"USDT transfers are now frozen.\n\n"
             msg += f"[View TX on {explorer_name}]({explorer_link})"
+
+    # Send to watchlist subscribers first (priority alert)
+    for (chat_id,) in watchlist_subscribers:
+        try:
+            watchlist_msg = "*[WATCHLIST ALERT]*\n\n" + msg
+            await bot.send_message(chat_id=chat_id, text=watchlist_msg, parse_mode="Markdown")
+            logger.info(f"Watchlist alert sent to {chat_id}: {address[:10]}...")
+        except Exception as e:
+            logger.error(f"Failed to send watchlist alert to {chat_id}: {e}")
+
+    if not subscribers:
+        logger.info(f"No subscribers for {address}")
+        return
 
     if BROADCAST_CHANNEL:
         try:
@@ -821,13 +993,16 @@ async def listen_to_tron_blacklist_events():
                     elapsed_seconds = None
                     if existing[2]:  # detected_at
                         try:
-                            detected_time = datetime.fromisoformat(
-                                existing[2].replace("Z", "+00:00")
-                            )
+                            detected_str = existing[2].replace("Z", "+00:00")
+                            detected_time = datetime.fromisoformat(detected_str)
+                            # Make timezone-aware if naive
+                            if detected_time.tzinfo is None:
+                                detected_time = detected_time.replace(tzinfo=timezone.utc)
                             elapsed_seconds = (
                                 datetime.now(timezone.utc) - detected_time
                             ).total_seconds()
-                        except Exception:
+                        except Exception as e:
+                            logger.error(f"Error calculating elapsed time: {e}")
                             pass
 
                     cursor.execute(
@@ -872,6 +1047,45 @@ async def listen_to_tron_blacklist_events():
                     "INSERT OR REPLACE INTO sync_state (key, value) VALUES ('tron_last_block_timestamp', ?)",
                     (str(max_ts),),
                 )
+
+            # Check pending addresses that might have been confirmed on-chain
+            cursor.execute(
+                "SELECT address, detected_at FROM blacklist WHERE chain = 'TRON' AND status = 'pending'"
+            )
+            pending_addresses = cursor.fetchall()
+
+            for pending_addr, detected_at in pending_addresses:
+                is_now_blocked = await check_address_blacklisted(pending_addr)
+                if is_now_blocked:
+                    # Calculate elapsed time
+                    elapsed_seconds = None
+                    if detected_at:
+                        try:
+                            detected_time = datetime.fromisoformat(detected_at)
+                            if detected_time.tzinfo is None:
+                                detected_time = detected_time.replace(tzinfo=timezone.utc)
+                            elapsed_seconds = (datetime.now(timezone.utc) - detected_time).total_seconds()
+                        except Exception:
+                            pass
+
+                    cursor.execute(
+                        "UPDATE blacklist SET status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP WHERE address = ? AND chain = 'TRON'",
+                        (pending_addr,)
+                    )
+                    logger.info(f"TRON CONFIRMED (via check): {pending_addr} (elapsed: {elapsed_seconds:.0f}s)" if elapsed_seconds else f"TRON CONFIRMED (via check): {pending_addr}")
+
+                    if alerts_sent < MAX_ALERTS_PER_CYCLE:
+                        balance = await get_tron_usdt_balance(pending_addr)
+                        await broadcast_alert(
+                            pending_addr,
+                            "confirmed",
+                            "",  # No tx_hash available
+                            chain="TRON",
+                            balance=balance,
+                            elapsed_seconds=elapsed_seconds,
+                            is_update=True,
+                        )
+                        alerts_sent += 1
 
             conn.commit()
             conn.close()
