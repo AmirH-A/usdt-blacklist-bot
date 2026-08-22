@@ -1,0 +1,1 @@
+"""USDT Blacklist Monitor Bot."""
