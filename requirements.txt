@@ -3,3 +3,5 @@ fastapi
 uvicorn
 python-dotenv
 httpx
+grpcio>=1.60.0
+tron-sdk-py

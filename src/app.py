@@ -12,6 +12,7 @@ from .config import (
     TRON_USDT_CONTRACT,
     ETH_USDT_CONTRACT,
     TRON_MULTISIG_WALLET,
+    ETH_MULTISIG_WALLET,
     MAX_CONSECUTIVE_FAILURES,
     logger,
 )
@@ -20,39 +21,35 @@ from .bot import bot, dp
 from .bot import handlers  # noqa: F401
 from . import health
 from .listeners import (
-    listen_to_tron_blacklist_events,
-    listen_to_eth_blacklist_events,
-    listen_to_mempool,
+    listen_to_tron_blocks,
     listen_to_multisig_submissions,
     listen_to_eth_multisig_submissions,
-    listen_to_eth_mempool,
 )
+
+
+def _start_listeners():
+    tasks = []
+    if ENABLE_TRON:
+        tasks.append(asyncio.create_task(listen_to_tron_blocks()))
+        tasks.append(asyncio.create_task(listen_to_multisig_submissions()))
+        logger.info("TRON block watcher + HTTP fallback started")
+    if ENABLE_ETH:
+        tasks.append(asyncio.create_task(listen_to_eth_multisig_submissions()))
+        logger.info("ETH MultiSig listener started (Submission + Execution)")
+
+    chains = []
+    if ENABLE_TRON:
+        chains.append("TRON blocks")
+    if ENABLE_ETH:
+        chains.append("ETH MultiSig")
+    logger.info(f"Bot started. Watching {' & '.join(chains) or 'nothing'} for USDT blacklist.")
+    return tasks
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    listener_tasks = []
-
-    if ENABLE_TRON:
-        listener_tasks.append(asyncio.create_task(listen_to_multisig_submissions()))
-        logger.info("MULTISIG listener started - EARLIEST DETECTION")
-
-        listener_tasks.append(asyncio.create_task(listen_to_mempool()))
-        logger.info("MEMPOOL listener started - EARLY DETECTION")
-
-        listener_tasks.append(asyncio.create_task(listen_to_tron_blacklist_events()))
-        logger.info("TRON event listener started")
-
-    if ENABLE_ETH:
-        listener_tasks.append(asyncio.create_task(listen_to_eth_multisig_submissions()))
-        logger.info("ETH MULTISIG listener started")
-
-        listener_tasks.append(asyncio.create_task(listen_to_eth_mempool()))
-        logger.info("ETH MEMPOOL listener started (Alchemy)")
-
-        listener_tasks.append(asyncio.create_task(listen_to_eth_blacklist_events()))
-        logger.info("ETH event listener started")
+    listener_tasks = _start_listeners()
 
     if WEBHOOK_URL:
         await bot.set_webhook(
@@ -61,13 +58,6 @@ async def lifespan(app: FastAPI):
             drop_pending_updates=True,
         )
         logger.info(f"Webhook: {WEBHOOK_URL}/webhook")
-
-    chains = []
-    if ENABLE_TRON:
-        chains.append("TRON (MultiSig + mempool + events)")
-    if ENABLE_ETH:
-        chains.append("ETH (MultiSig + mempool + events)")
-    logger.info(f"Bot started. Monitoring {' & '.join(chains)} USDT blacklist...")
 
     yield
 
@@ -111,23 +101,27 @@ async def health_endpoint():
             "eth": {
                 "enabled": ENABLE_ETH,
                 "contract": ETH_USDT_CONTRACT,
+                "multisig_wallet": ETH_MULTISIG_WALLET,
             },
         },
         "scanners": {
-            "multisig": {
+            "tron_blocks": {
+                "scans": health.block_scan_count,
+                "failures": health.block_consecutive_failures,
+                "last_block": health.block_last_number,
+                "detections": health.block_detections,
+                "source": health.block_source,
+                "healthy": health.block_consecutive_failures < MAX_CONSECUTIVE_FAILURES,
+            },
+            "tron_multisig_fallback": {
                 "scans": health.multisig_scan_count,
                 "failures": health.multisig_consecutive_failures,
                 "healthy": health.multisig_consecutive_failures < MAX_CONSECUTIVE_FAILURES,
             },
-            "tron_mempool": {
-                "scans": health.mempool_scan_count,
-                "failures": health.mempool_consecutive_failures,
-                "healthy": health.mempool_consecutive_failures < MAX_CONSECUTIVE_FAILURES,
-            },
-            "eth_mempool": {
-                "scans": health.eth_mempool_scan_count,
-                "failures": health.eth_mempool_consecutive_failures,
-                "healthy": health.eth_mempool_consecutive_failures < MAX_CONSECUTIVE_FAILURES,
+            "eth_multisig": {
+                "scans": health.eth_multisig_scan_count,
+                "failures": health.eth_multisig_consecutive_failures,
+                "healthy": health.eth_multisig_consecutive_failures < MAX_CONSECUTIVE_FAILURES,
             },
         },
     }
@@ -135,35 +129,7 @@ async def health_endpoint():
 
 async def run_polling():
     init_db()
-    listener_tasks = []
-
-    if ENABLE_TRON:
-        listener_tasks.append(asyncio.create_task(listen_to_multisig_submissions()))
-        logger.info("MULTISIG listener started - EARLIEST DETECTION")
-
-        listener_tasks.append(asyncio.create_task(listen_to_mempool()))
-        logger.info("MEMPOOL listener started - EARLY DETECTION")
-
-        listener_tasks.append(asyncio.create_task(listen_to_tron_blacklist_events()))
-        logger.info("TRON event listener started")
-
-    if ENABLE_ETH:
-        listener_tasks.append(asyncio.create_task(listen_to_eth_multisig_submissions()))
-        logger.info("ETH MULTISIG listener started")
-
-        listener_tasks.append(asyncio.create_task(listen_to_eth_mempool()))
-        logger.info("ETH MEMPOOL listener started (Alchemy)")
-
-        listener_tasks.append(asyncio.create_task(listen_to_eth_blacklist_events()))
-        logger.info("ETH event listener started")
-
-    chains = []
-    if ENABLE_TRON:
-        chains.append("TRON (MultiSig + mempool + events)")
-    if ENABLE_ETH:
-        chains.append("ETH (MultiSig + mempool + events)")
-    logger.info(f"Bot started. Monitoring {' & '.join(chains)} USDT blacklist...")
-
+    listener_tasks = _start_listeners()
     try:
         await dp.start_polling(bot)
     finally:

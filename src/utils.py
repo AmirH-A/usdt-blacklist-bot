@@ -1,26 +1,4 @@
-import asyncio
 from typing import Optional
-
-from .config import TRONGRID_MIN_INTERVAL
-from . import health
-
-
-async def trongrid_rate_limit():
-    async with health.trongrid_semaphore:
-        now = asyncio.get_event_loop().time()
-        elapsed = now - health.trongrid_last_request
-        if elapsed < TRONGRID_MIN_INTERVAL:
-            await asyncio.sleep(TRONGRID_MIN_INTERVAL - elapsed)
-        health.trongrid_last_request = asyncio.get_event_loop().time()
-
-
-async def trongrid_mempool_rate_limit():
-    async with health.trongrid_mempool_semaphore:
-        now = asyncio.get_event_loop().time()
-        elapsed = now - health.trongrid_mempool_last_request
-        if elapsed < TRONGRID_MIN_INTERVAL:
-            await asyncio.sleep(TRONGRID_MIN_INTERVAL - elapsed)
-        health.trongrid_mempool_last_request = asyncio.get_event_loop().time()
 
 
 def format_usdt_balance(balance: Optional[float]) -> str:
