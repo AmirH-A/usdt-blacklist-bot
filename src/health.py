@@ -9,3 +9,9 @@ block_consecutive_failures = 0
 block_last_number = 0
 block_detections = 0
 block_source = ""
+
+eth_block_scan_count = 0
+eth_block_consecutive_failures = 0
+eth_block_last_number = 0
+eth_block_detections = 0
+eth_block_source = ""

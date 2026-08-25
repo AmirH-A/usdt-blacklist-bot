@@ -23,8 +23,10 @@ from . import health
 from .listeners import (
     listen_to_tron_blocks,
     listen_to_multisig_submissions,
+    listen_to_eth_blocks,
     listen_to_eth_multisig_submissions,
 )
+from .eth.rpc import rpc_enabled
 
 
 def _start_listeners():
@@ -34,14 +36,19 @@ def _start_listeners():
         tasks.append(asyncio.create_task(listen_to_multisig_submissions()))
         logger.info("TRON block watcher + HTTP fallback started")
     if ENABLE_ETH:
+        if rpc_enabled():
+            tasks.append(asyncio.create_task(listen_to_eth_blocks()))
+            logger.info("ETH block watcher + Etherscan fallback started")
+        else:
+            logger.warning("ETH_RPC_URL unset; ETH live path is Etherscan only")
         tasks.append(asyncio.create_task(listen_to_eth_multisig_submissions()))
-        logger.info("ETH MultiSig listener started (Submission + Execution)")
+        logger.info("ETH MultiSig Etherscan fallback started (Submission + Execution)")
 
     chains = []
     if ENABLE_TRON:
         chains.append("TRON blocks")
     if ENABLE_ETH:
-        chains.append("ETH MultiSig")
+        chains.append("ETH blocks" if rpc_enabled() else "ETH MultiSig")
     logger.info(f"Bot started. Watching {' & '.join(chains) or 'nothing'} for USDT blacklist.")
     return tasks
 
@@ -88,6 +95,13 @@ async def handle_webhook(
     return {"status": "ok"}
 
 
+@app.get("/accuracy")
+async def accuracy_endpoint():
+    from .accuracy import build_report
+
+    return build_report()
+
+
 @app.get("/health")
 async def health_endpoint():
     return {
@@ -118,7 +132,16 @@ async def health_endpoint():
                 "failures": health.multisig_consecutive_failures,
                 "healthy": health.multisig_consecutive_failures < MAX_CONSECUTIVE_FAILURES,
             },
-            "eth_multisig": {
+            "eth_blocks": {
+                "enabled": rpc_enabled(),
+                "scans": health.eth_block_scan_count,
+                "failures": health.eth_block_consecutive_failures,
+                "last_block": health.eth_block_last_number,
+                "detections": health.eth_block_detections,
+                "source": health.eth_block_source,
+                "healthy": health.eth_block_consecutive_failures < MAX_CONSECUTIVE_FAILURES,
+            },
+            "eth_multisig_fallback": {
                 "scans": health.eth_multisig_scan_count,
                 "failures": health.eth_multisig_consecutive_failures,
                 "healthy": health.eth_multisig_consecutive_failures < MAX_CONSECUTIVE_FAILURES,

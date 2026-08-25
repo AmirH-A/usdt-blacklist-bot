@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional
 
 from ..config import (
     logger,

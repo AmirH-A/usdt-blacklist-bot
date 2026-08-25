@@ -36,7 +36,9 @@ def migrate_db():
     if "block_timestamp" not in columns:
         logger.info("Adding block_timestamp column...")
         cursor.execute("ALTER TABLE blacklist ADD COLUMN block_timestamp INTEGER")
-        cursor.execute("ALTER TABLE blacklist ADD COLUMN confirmed_block_timestamp INTEGER")
+        cursor.execute(
+            "ALTER TABLE blacklist ADD COLUMN confirmed_block_timestamp INTEGER"
+        )
         conn.commit()
         logger.info("Block timestamp columns added.")
 
@@ -47,14 +49,17 @@ def init_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     cursor = conn.cursor()
 
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS subscribers (
             chat_id INTEGER PRIMARY KEY,
             subscribed_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
-    """)
+    """
+    )
 
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS blacklist (
             address TEXT NOT NULL,
             chain TEXT NOT NULL DEFAULT 'TRON',
@@ -67,16 +72,20 @@ def init_db():
             confirmed_block_timestamp INTEGER,
             PRIMARY KEY (address, chain)
         )
-    """)
+    """
+    )
 
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS sync_state (
             key TEXT PRIMARY KEY,
             value TEXT
         )
-    """)
+    """
+    )
 
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS watchlist (
             chat_id INTEGER NOT NULL,
             address TEXT NOT NULL,
@@ -84,9 +93,11 @@ def init_db():
             added_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (chat_id, address, chain)
         )
-    """)
+    """
+    )
 
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS multisig_pending (
             tx_id INTEGER NOT NULL,
             chain TEXT NOT NULL DEFAULT 'TRON',
@@ -100,7 +111,8 @@ def init_db():
             alerted INTEGER DEFAULT 0,
             PRIMARY KEY (tx_id, chain)
         )
-    """)
+    """
+    )
 
     try:
         cursor.execute(
@@ -121,6 +133,51 @@ def _placeholder_tx_id(tx_hash: str) -> int:
         return int(tx_hash[:8], 16)
     except (TypeError, ValueError):
         return 0
+
+
+def bind_multisig_tx_id(chain: str, tx_hash: str, real_tx_id: int) -> bool:
+    """Replace a hash-prefix placeholder tx_id with the real MultiSig id.
+
+    The block watcher records pending before Submission logs are available, so
+    execute events (which carry the real id) would otherwise never match.
+    """
+    if not tx_hash or real_tx_id is None:
+        return False
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """SELECT tx_id FROM multisig_pending
+               WHERE chain = ? AND LOWER(submission_tx_hash) = LOWER(?)""",
+            (chain, tx_hash),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return False
+        current_id = row[0]
+        if current_id == real_tx_id:
+            return False
+        cursor.execute(
+            "SELECT 1 FROM multisig_pending WHERE tx_id = ? AND chain = ?",
+            (real_tx_id, chain),
+        )
+        if cursor.fetchone():
+            logger.warning(
+                f"Cannot bind MultiSig tx_id {real_tx_id} to {tx_hash[:16]}...; id already used"
+            )
+            return False
+        cursor.execute(
+            """UPDATE multisig_pending SET tx_id = ?
+               WHERE chain = ? AND LOWER(submission_tx_hash) = LOWER(?)""",
+            (real_tx_id, chain, tx_hash),
+        )
+        conn.commit()
+        logger.info(
+            f"Bound MultiSig tx_id {current_id} -> {real_tx_id} for {tx_hash[:16]}..."
+        )
+        return True
+    finally:
+        conn.close()
 
 
 def record_multisig_submission(
@@ -191,6 +248,7 @@ def mark_multisig_executed(
     exec_tx_id: Optional[int] = None,
     target_address: Optional[str] = None,
     exec_tx_hash: str = "",
+    confirmed_block_timestamp: Optional[int] = None,
 ) -> Optional[dict]:
     conn = get_db()
     cursor = conn.cursor()
@@ -231,9 +289,16 @@ def mark_multisig_executed(
         new_status = "confirmed" if action == "blacklist" else "unfrozen"
         cursor.execute(
             """UPDATE blacklist
-               SET status = ?, confirmed_at = CURRENT_TIMESTAMP, tx_hash = ?, alerted = 1
+               SET status = ?, confirmed_at = CURRENT_TIMESTAMP, tx_hash = ?,
+                   alerted = 1, confirmed_block_timestamp = ?
                WHERE address = ? AND chain = ?""",
-            (new_status, exec_tx_hash or submission_tx_hash, target_address, chain),
+            (
+                new_status,
+                exec_tx_hash or submission_tx_hash,
+                confirmed_block_timestamp,
+                target_address,
+                chain,
+            ),
         )
         conn.commit()
         return {
@@ -241,6 +306,7 @@ def mark_multisig_executed(
             "action": action,
             "tx_hash": exec_tx_hash or submission_tx_hash,
             "submitted_ts": submitted_ts,
+            "confirmed_block_timestamp": confirmed_block_timestamp,
         }
     finally:
         conn.close()
@@ -360,13 +426,19 @@ def get_stats() -> dict:
     cursor.execute("SELECT COUNT(*) FROM subscribers")
     subscribers = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM blacklist WHERE chain = 'TRON' AND status = 'confirmed'")
+    cursor.execute(
+        "SELECT COUNT(*) FROM blacklist WHERE chain = 'TRON' AND status = 'confirmed'"
+    )
     tron_confirmed = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM blacklist WHERE chain = 'TRON' AND status = 'unfrozen'")
+    cursor.execute(
+        "SELECT COUNT(*) FROM blacklist WHERE chain = 'TRON' AND status = 'unfrozen'"
+    )
     tron_unfrozen = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM blacklist WHERE chain = 'ETH' AND status = 'confirmed'")
+    cursor.execute(
+        "SELECT COUNT(*) FROM blacklist WHERE chain = 'ETH' AND status = 'confirmed'"
+    )
     eth_confirmed = cursor.fetchone()[0]
 
     cursor.execute("SELECT value FROM sync_state WHERE key = 'tron_last_scan'")

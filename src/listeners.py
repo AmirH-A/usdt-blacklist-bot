@@ -7,27 +7,31 @@ from .config import (
     MULTISIG_SCAN_INTERVAL,
     ETH_MULTISIG_SCAN_INTERVAL,
     BLOCK_POLL_INTERVAL,
+    ETH_BLOCK_POLL_INTERVAL,
     ADMIN_CHAT_ID,
     logger,
 )
 from . import database, health
 from .bot import bot
-from .bot.alerts import broadcast_alert, broadcast_early_warning_alert
+from .bot.alerts import (
+    broadcast_early_warning_alerts,
+    broadcast_confirmed_alerts,
+)
 from .tron import (
     decode_multisig_submit_data,
     get_multisig_submission_events,
     get_multisig_execution_events,
     get_multisig_tx_details,
-    get_tron_usdt_balance,
 )
 from .tron.block_watcher import BlockCursor, extract_multisig_ops
 from .eth import (
-    get_eth_usdt_balance,
     get_eth_multisig_submission_events,
     get_eth_multisig_execution_events,
     get_eth_multisig_tx_target,
     get_current_eth_block,
+    rpc_enabled,
 )
+from .eth.block_watcher import EthBlockCursor, ops_from_eth_block
 
 
 async def _notify_scanner_down(name: str, error: Exception):
@@ -43,56 +47,64 @@ async def _notify_scanner_down(name: str, error: Exception):
         pass
 
 
-async def _emit_pending(target_address: str, action: str, tx_hash: str, block_timestamp, chain="TRON", multisig_tx_id=0):
-    await broadcast_early_warning_alert(
-        address=target_address,
-        action=action,
-        multisig_tx_id=multisig_tx_id,
-        tx_hash=tx_hash,
-        chain=chain,
-        balance=None,
-        block_timestamp=block_timestamp,
-    )
+def _pending_item(op: dict, chain: str) -> dict:
+    return {
+        "address": op["target_address"],
+        "action": op["action"],
+        "tx_hash": op["tx_hash"],
+        "block_timestamp": op["block_timestamp"],
+        "block_number": op.get("block_number"),
+        "chain": chain,
+        "multisig_tx_id": op.get("multisig_tx_id") or 0,
+        "balance": None,
+    }
 
 
-async def _emit_confirmed(marked: dict, exec_event: dict, chain: str):
-    if not marked or marked["action"] != "blacklist":
-        return
+def _confirmed_item(marked: dict, exec_event: dict, chain: str) -> dict:
     elapsed = None
-    if marked["submitted_ts"] and exec_event.get("block_timestamp"):
-        elapsed = (exec_event["block_timestamp"] - marked["submitted_ts"]) / 1000.0
-    if chain == "TRON":
-        balance = await get_tron_usdt_balance(marked["target_address"])
-    else:
-        balance = await get_eth_usdt_balance(marked["target_address"])
-    await broadcast_alert(
-        marked["target_address"],
-        "confirmed",
-        marked["tx_hash"],
-        chain=chain,
-        balance=balance,
-        elapsed_seconds=elapsed,
-        is_update=True,
+    submitted_ts = marked.get("submitted_ts")
+    confirmed_ts = exec_event.get("block_timestamp") or marked.get(
+        "confirmed_block_timestamp"
     )
+    if submitted_ts and confirmed_ts:
+        elapsed = (confirmed_ts - submitted_ts) / 1000.0
+    return {
+        "address": marked["target_address"],
+        "action": marked["action"],
+        "tx_hash": marked["tx_hash"],
+        "chain": chain,
+        "block_timestamp": confirmed_ts,
+        "block_number": exec_event.get("block_number"),
+        "elapsed_seconds": elapsed,
+        "is_update": True,
+        "balance": None,
+        "multisig_tx_id": exec_event.get("multisig_tx_id")
+        or exec_event.get("transaction_id")
+        or 0,
+    }
 
 
-async def _handle_block_ops(ops: list):
+async def _handle_block_ops(ops: list, chain: str):
     pending_alerts = []
     executions = []
 
     for op in ops:
         if op["kind"] == "submission":
             is_new = database.record_multisig_submission(
-                chain="TRON",
+                chain=chain,
                 tx_hash=op["tx_hash"],
                 target_address=op["target_address"],
                 action=op["action"],
                 block_timestamp=op["block_timestamp"],
+                multisig_tx_id=op.get("multisig_tx_id"),
             )
             if is_new:
-                health.block_detections += 1
+                if chain == "TRON":
+                    health.block_detections += 1
+                else:
+                    health.eth_block_detections += 1
                 logger.info(
-                    f"BLOCK {op['action'].upper()}: {op['target_address']} "
+                    f"{chain} BLOCK {op['action'].upper()}: {op['target_address']} "
                     f"(block {op['block_number']}, {op['tx_hash'][:16]}...)"
                 )
                 pending_alerts.append(op)
@@ -100,32 +112,29 @@ async def _handle_block_ops(ops: list):
             executions.append(op)
 
     if pending_alerts:
-        await asyncio.gather(
-            *[
-                _emit_pending(
-                    op["target_address"],
-                    op["action"],
-                    op["tx_hash"],
-                    op["block_timestamp"],
-                    multisig_tx_id=0,
-                )
-                for op in pending_alerts
-            ],
-            return_exceptions=True,
+        asyncio.create_task(
+            broadcast_early_warning_alerts(
+                [_pending_item(op, chain) for op in pending_alerts]
+            )
         )
 
+    confirmed_alerts = []
     for op in executions:
         marked = database.mark_multisig_executed(
-            "TRON",
+            chain,
             exec_tx_id=op.get("multisig_tx_id"),
             exec_tx_hash=op.get("tx_hash", ""),
+            confirmed_block_timestamp=op.get("block_timestamp"),
         )
         if marked:
             logger.info(
-                f"BLOCK EXECUTED: {marked['action']} -> {marked['target_address']} "
+                f"{chain} BLOCK EXECUTED: {marked['action']} -> {marked['target_address']} "
                 f"(block {op['block_number']})"
             )
-            asyncio.create_task(_emit_confirmed(marked, op, "TRON"))
+            confirmed_alerts.append(_confirmed_item(marked, op, chain))
+
+    if confirmed_alerts:
+        asyncio.create_task(broadcast_confirmed_alerts(confirmed_alerts))
 
 
 async def listen_to_tron_blocks():
@@ -149,7 +158,7 @@ async def listen_to_tron_blocks():
             for block in blocks:
                 ops = extract_multisig_ops(block)
                 if ops:
-                    await _handle_block_ops(ops)
+                    await _handle_block_ops(ops, "TRON")
                 cursor.last_block = max(cursor.last_block, block["block_number"])
 
             cursor.persist()
@@ -161,14 +170,60 @@ async def listen_to_tron_blocks():
 
         except Exception as e:
             health.block_consecutive_failures += 1
-            logger.error(f"TRON block watcher error ({health.block_consecutive_failures}x): {e}")
+            logger.error(
+                f"TRON block watcher error ({health.block_consecutive_failures}x): {e}"
+            )
             if health.block_consecutive_failures == MAX_CONSECUTIVE_FAILURES:
                 await _notify_scanner_down("TRON BLOCK WATCHER", e)
             await asyncio.sleep(2)
 
 
+async def listen_to_eth_blocks():
+    if not rpc_enabled():
+        logger.warning("ETH_RPC_URL unset; skipping ETH block watcher")
+        return
+
+    logger.info(
+        f"ETH block watcher started (poll {ETH_BLOCK_POLL_INTERVAL}s, "
+        "decode submitTransaction from calldata)"
+    )
+    cursor = EthBlockCursor()
+    cursor.load()
+
+    while True:
+        try:
+            health.eth_block_scan_count += 1
+            blocks = await cursor.next_blocks()
+
+            if not blocks:
+                health.eth_block_consecutive_failures = 0
+                await asyncio.sleep(ETH_BLOCK_POLL_INTERVAL)
+                continue
+
+            for block in blocks:
+                ops = await ops_from_eth_block(block)
+                if ops:
+                    await _handle_block_ops(ops, "ETH")
+                cursor.last_block = max(cursor.last_block, block["block_number"])
+
+            cursor.persist()
+            health.eth_block_consecutive_failures = 0
+
+            if len(blocks) > 1:
+                continue
+            await asyncio.sleep(ETH_BLOCK_POLL_INTERVAL)
+
+        except Exception as e:
+            health.eth_block_consecutive_failures += 1
+            logger.error(
+                f"ETH block watcher error ({health.eth_block_consecutive_failures}x): {e}"
+            )
+            if health.eth_block_consecutive_failures == MAX_CONSECUTIVE_FAILURES:
+                await _notify_scanner_down("ETH BLOCK WATCHER", e)
+            await asyncio.sleep(2)
+
+
 async def listen_to_multisig_submissions():
-    """TronGrid event API safety net — catches gaps, does not drive live alerts."""
     logger.info(
         f"TRON MultiSig HTTP fallback started (every {MULTISIG_SCAN_INTERVAL}s)"
     )
@@ -203,6 +258,7 @@ async def listen_to_multisig_submissions():
                 conn.close()
 
                 if existing and existing[0]:
+                    database.bind_multisig_tx_id("TRON", tx_hash, tx_id)
                     processed_timestamps.append(block_timestamp)
                     continue
 
@@ -214,7 +270,12 @@ async def listen_to_multisig_submissions():
                 if not data:
                     contracts = tx_details.get("raw_data", {}).get("contract", [])
                     if contracts:
-                        data = contracts[0].get("parameter", {}).get("value", {}).get("data", "")
+                        data = (
+                            contracts[0]
+                            .get("parameter", {})
+                            .get("value", {})
+                            .get("data", "")
+                        )
                 decoded = decode_multisig_submit_data(data) if data else None
                 if not decoded:
                     processed_timestamps.append(block_timestamp)
@@ -232,16 +293,33 @@ async def listen_to_multisig_submissions():
                     f"HTTP FALLBACK: {decoded['action']} -> {decoded['target_address']} (TX #{tx_id})"
                 )
                 if is_new:
-                    alerts.append((decoded["target_address"], decoded["action"], tx_hash, block_timestamp, tx_id))
+                    alerts.append(
+                        (
+                            decoded["target_address"],
+                            decoded["action"],
+                            tx_hash,
+                            block_timestamp,
+                            tx_id,
+                        )
+                    )
                 processed_timestamps.append(block_timestamp)
 
             if alerts:
-                await asyncio.gather(
-                    *[
-                        _emit_pending(addr, action, tx_hash, ts, multisig_tx_id=tx_id)
-                        for addr, action, tx_hash, ts, tx_id in alerts[:MAX_ALERTS_PER_CYCLE]
-                    ],
-                    return_exceptions=True,
+                await broadcast_early_warning_alerts(
+                    [
+                        {
+                            "address": addr,
+                            "action": action,
+                            "tx_hash": tx_hash,
+                            "block_timestamp": ts,
+                            "chain": "TRON",
+                            "multisig_tx_id": tx_id,
+                            "balance": None,
+                        }
+                        for addr, action, tx_hash, ts, tx_id in alerts[
+                            :MAX_ALERTS_PER_CYCLE
+                        ]
+                    ]
                 )
 
             if processed_timestamps:
@@ -250,22 +328,31 @@ async def listen_to_multisig_submissions():
                     database.set_sync_state("multisig_last_timestamp", str(new_ts))
                     last_timestamp = new_ts
 
-            exec_from = last_timestamp - 10 * 60 * 1000 if last_timestamp > 10 * 60 * 1000 else last_timestamp
-            exec_events = await get_multisig_execution_events(min_timestamp=exec_from)
+            recent_subs = await get_multisig_submission_events()
+            for event in recent_subs:
+                if event.get("tx_hash") and event.get("transaction_id") is not None:
+                    database.bind_multisig_tx_id(
+                        "TRON", event["tx_hash"], event["transaction_id"]
+                    )
+
+            exec_events = await get_multisig_execution_events()
             confirmed = []
             for exec_event in exec_events:
                 marked = database.mark_multisig_executed(
                     "TRON",
                     exec_tx_id=exec_event["transaction_id"],
                     exec_tx_hash=exec_event.get("tx_hash", ""),
+                    confirmed_block_timestamp=exec_event.get("block_timestamp"),
                 )
                 if marked:
                     confirmed.append((marked, exec_event))
 
             if confirmed:
-                await asyncio.gather(
-                    *[_emit_confirmed(marked, event, "TRON") for marked, event in confirmed],
-                    return_exceptions=True,
+                await broadcast_confirmed_alerts(
+                    [
+                        _confirmed_item(marked, event, "TRON")
+                        for marked, event in confirmed
+                    ]
                 )
 
             health.multisig_consecutive_failures = 0
@@ -273,14 +360,18 @@ async def listen_to_multisig_submissions():
 
         except Exception as e:
             health.multisig_consecutive_failures += 1
-            logger.error(f"MultiSig HTTP fallback error ({health.multisig_consecutive_failures}x): {e}")
+            logger.error(
+                f"MultiSig HTTP fallback error ({health.multisig_consecutive_failures}x): {e}"
+            )
             if health.multisig_consecutive_failures == MAX_CONSECUTIVE_FAILURES:
                 await _notify_scanner_down("TRON MULTISIG HTTP", e)
             await asyncio.sleep(10)
 
 
 async def listen_to_eth_multisig_submissions():
-    logger.info("ETH MultiSig listener started")
+    logger.info(
+        f"ETH MultiSig HTTP fallback started (every {ETH_MULTISIG_SCAN_INTERVAL}s)"
+    )
 
     last_block_str = database.get_sync_state("eth_multisig_last_block")
     last_block = int(last_block_str) if last_block_str else 0
@@ -317,11 +408,14 @@ async def listen_to_eth_multisig_submissions():
                 conn = database.get_db()
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT tx_id FROM multisig_pending WHERE tx_id = ? AND chain = 'ETH'",
-                    (tx_id,),
+                    """SELECT tx_id FROM multisig_pending
+                       WHERE chain = 'ETH' AND (tx_id = ? OR submission_tx_hash = ?)""",
+                    (tx_id, tx_hash),
                 )
                 existing = cursor.fetchone()
                 conn.close()
+
+                database.bind_multisig_tx_id("ETH", tx_hash, tx_id)
 
                 if existing:
                     processed_blocks.append(block_number)
@@ -342,18 +436,31 @@ async def listen_to_eth_multisig_submissions():
                     block_timestamp=block_timestamp,
                     multisig_tx_id=tx_id,
                 )
-                logger.info(f"ETH MULTISIG EARLY DETECTION: {action} -> {target_address} (TX #{tx_id})")
+                logger.info(
+                    f"ETH HTTP FALLBACK: {action} -> {target_address} (TX #{tx_id})"
+                )
                 if is_new:
-                    alerts.append((target_address, action, tx_hash, block_timestamp, tx_id))
+                    alerts.append(
+                        (target_address, action, tx_hash, block_timestamp, tx_id)
+                    )
                 processed_blocks.append(block_number)
 
             if alerts:
-                await asyncio.gather(
-                    *[
-                        _emit_pending(addr, action, tx_hash, ts, chain="ETH", multisig_tx_id=tx_id)
-                        for addr, action, tx_hash, ts, tx_id in alerts[:MAX_ALERTS_PER_CYCLE]
-                    ],
-                    return_exceptions=True,
+                await broadcast_early_warning_alerts(
+                    [
+                        {
+                            "address": addr,
+                            "action": action,
+                            "tx_hash": tx_hash,
+                            "block_timestamp": ts,
+                            "chain": "ETH",
+                            "multisig_tx_id": tx_id,
+                            "balance": None,
+                        }
+                        for addr, action, tx_hash, ts, tx_id in alerts[
+                            :MAX_ALERTS_PER_CYCLE
+                        ]
+                    ]
                 )
 
             if processed_blocks:
@@ -370,23 +477,30 @@ async def listen_to_eth_multisig_submissions():
                     "ETH",
                     exec_tx_id=exec_event["transaction_id"],
                     exec_tx_hash=exec_event.get("tx_hash", ""),
+                    confirmed_block_timestamp=exec_event.get("block_timestamp"),
                 )
                 if marked:
                     confirmed.append((marked, exec_event))
 
             if confirmed:
-                await asyncio.gather(
-                    *[_emit_confirmed(marked, event, "ETH") for marked, event in confirmed],
-                    return_exceptions=True,
+                await broadcast_confirmed_alerts(
+                    [
+                        _confirmed_item(marked, event, "ETH")
+                        for marked, event in confirmed
+                    ]
                 )
 
-            database.set_sync_state("eth_last_scan", datetime.now(timezone.utc).isoformat())
+            database.set_sync_state(
+                "eth_last_scan", datetime.now(timezone.utc).isoformat()
+            )
             health.eth_multisig_consecutive_failures = 0
             await asyncio.sleep(ETH_MULTISIG_SCAN_INTERVAL)
 
         except Exception as e:
             health.eth_multisig_consecutive_failures += 1
-            logger.error(f"ETH MultiSig listener error ({health.eth_multisig_consecutive_failures}x): {e}")
+            logger.error(
+                f"ETH MultiSig listener error ({health.eth_multisig_consecutive_failures}x): {e}"
+            )
             if health.eth_multisig_consecutive_failures == MAX_CONSECUTIVE_FAILURES:
                 await _notify_scanner_down("ETH MULTISIG", e)
             await asyncio.sleep(10)

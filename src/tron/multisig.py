@@ -178,6 +178,7 @@ async def get_multisig_execution_events(
                                 "transaction_id": int(tx_id),
                                 "tx_hash": event.get("transaction_id"),
                                 "block_timestamp": event.get("block_timestamp"),
+                                "block_number": event.get("block_number"),
                             }
                         )
     except Exception as e:
