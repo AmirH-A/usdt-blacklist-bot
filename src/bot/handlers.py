@@ -8,16 +8,25 @@ from ..config import (
     ENABLE_TRON,
     ENABLE_ETH,
     WHALE_THRESHOLD,
-    MEMPOOL_SCAN_INTERVAL,
     MULTISIG_SCAN_INTERVAL,
     ETH_MULTISIG_SCAN_INTERVAL,
+    BLOCK_POLL_INTERVAL,
+    ETH_BLOCK_POLL_INTERVAL,
     MAX_CONSECUTIVE_FAILURES,
     logger,
 )
 from .. import database, health
 from ..utils import format_usdt_balance, format_time_ago
-from ..tron import is_valid_tron_address, check_address_blacklisted, get_tron_usdt_balance
-from ..eth import is_valid_eth_address, check_eth_address_blacklisted, get_eth_usdt_balance
+from ..tron import (
+    is_valid_tron_address,
+    check_address_blacklisted,
+    get_tron_usdt_balance,
+)
+from ..eth import (
+    is_valid_eth_address,
+    check_eth_address_blacklisted,
+    get_eth_usdt_balance,
+)
 
 
 def detect_chain(address: str):
@@ -45,8 +54,8 @@ async def start_cmd(message: Message):
         f"Monitoring: {chains_text}\n"
         f"Subscribed to blacklist alerts.\n\n"
         "*Alerts:*\n"
-        "PENDING - Blacklist tx detected (unconfirmed)\n"
-        "BLOCKED - Address officially frozen\n"
+        "PENDING - Issuer MultiSig submitted addBlackList\n"
+        "BLOCKED - MultiSig executed (address frozen)\n"
         "WHALE - Large balance (>$100k) blocked\n\n"
         "*Commands:*\n"
         "/check <address> - Check address status\n"
@@ -157,19 +166,20 @@ async def stats_cmd(message: Message):
     msg += f"*Total:*\n"
     msg += f"Frozen: {stats['confirmed']}\n"
     msg += f"Pending: {stats['pending']}\n"
-    msg += f"Mempool Pending: {stats['mempool_pending']}\n"
     msg += f"Unfrozen: {stats['unfrozen']}\n"
     msg += f"Subscribers: {stats['subscribers']}\n\n"
     msg += f"*Per Chain:*\n"
-    msg += f"TRON: {stats['tron_confirmed']} frozen | {stats['tron_unfrozen']} unfrozen\n"
+    msg += (
+        f"TRON: {stats['tron_confirmed']} frozen | {stats['tron_unfrozen']} unfrozen\n"
+    )
     msg += f"ETH: {stats['eth_confirmed']} frozen\n\n"
     msg += f"*Scanners:*\n"
     if ENABLE_TRON:
-        msg += f"TRON Mempool: {health.mempool_scan_count} scans\n"
-        msg += f"TRON Events: {health.tron_scan_count} scans | Last: {tron_last}\n"
+        msg += f"TRON blocks: {health.block_scan_count} polls | Last: {tron_last}\n"
     if ENABLE_ETH:
-        msg += f"ETH Mempool: {health.eth_mempool_scan_count} scans\n"
-        msg += f"ETH Events: {health.eth_scan_count} scans | Last: {eth_last}"
+        msg += (
+            f"ETH MultiSig: {health.eth_multisig_scan_count} scans | Last: {eth_last}"
+        )
 
     await message.answer(msg, parse_mode="Markdown")
 
@@ -224,42 +234,73 @@ async def health_cmd(message: Message):
         except Exception:
             pass
 
-    mempool_status = "ACTIVE" if health.mempool_scan_count > 0 and health.mempool_consecutive_failures == 0 else "RECOVERING" if health.mempool_consecutive_failures < MAX_CONSECUTIVE_FAILURES else "FAILING"
-    eth_mempool_status = "ACTIVE" if health.eth_mempool_scan_count > 0 and health.eth_mempool_consecutive_failures == 0 else "RECOVERING" if health.eth_mempool_consecutive_failures < MAX_CONSECUTIVE_FAILURES else "FAILING"
-    multisig_status = "ACTIVE" if health.multisig_scan_count > 0 and health.multisig_consecutive_failures == 0 else "RECOVERING" if health.multisig_consecutive_failures < MAX_CONSECUTIVE_FAILURES else "FAILING"
-    eth_multisig_status = "ACTIVE" if health.eth_multisig_scan_count > 0 and health.eth_multisig_consecutive_failures == 0 else "RECOVERING" if health.eth_multisig_consecutive_failures < MAX_CONSECUTIVE_FAILURES else "FAILING"
+    multisig_status = (
+        "ACTIVE"
+        if health.multisig_scan_count > 0 and health.multisig_consecutive_failures == 0
+        else (
+            "RECOVERING"
+            if health.multisig_consecutive_failures < MAX_CONSECUTIVE_FAILURES
+            else "FAILING"
+        )
+    )
+    eth_multisig_status = (
+        "ACTIVE"
+        if health.eth_multisig_scan_count > 0
+        and health.eth_multisig_consecutive_failures == 0
+        else (
+            "RECOVERING"
+            if health.eth_multisig_consecutive_failures < MAX_CONSECUTIVE_FAILURES
+            else "FAILING"
+        )
+    )
+    eth_block_status = (
+        "ACTIVE"
+        if health.eth_block_scan_count > 0
+        and health.eth_block_consecutive_failures == 0
+        else (
+            "RECOVERING"
+            if health.eth_block_consecutive_failures < MAX_CONSECUTIVE_FAILURES
+            else "FAILING"
+        )
+    )
 
     msg = "*Scanner Health*\n\n"
-    msg += f"*TRON MULTISIG:* {multisig_status}\n"
+    block_status = (
+        "ACTIVE"
+        if health.block_scan_count > 0 and health.block_consecutive_failures == 0
+        else (
+            "RECOVERING"
+            if health.block_consecutive_failures < MAX_CONSECUTIVE_FAILURES
+            else "FAILING"
+        )
+    )
+    msg += f"*TRON BLOCKS:* {block_status}\n"
+    msg += f"Head: {health.block_last_number or 'n/a'}\n"
+    msg += f"Source: `{health.block_source or 'starting'}`\n"
+    msg += f"Poll: {BLOCK_POLL_INTERVAL}s | Detections: {health.block_detections}\n"
+    msg += f"Failures: {health.block_consecutive_failures}\n"
+    msg += f"Last scan: {tron_delay} ({tron_status})\n\n"
+    msg += f"*TRON HTTP FALLBACK:* {multisig_status}\n"
     msg += f"Scans: {health.multisig_scan_count}\n"
-    msg += f"Failures: {health.multisig_consecutive_failures}\n"
     msg += f"Interval: {MULTISIG_SCAN_INTERVAL}s\n\n"
-    msg += f"*TRON MEMPOOL:* {mempool_status}\n"
-    msg += f"Scans: {health.mempool_scan_count}\n"
-    msg += f"Failures: {health.mempool_consecutive_failures}\n"
-    msg += f"Interval: {MEMPOOL_SCAN_INTERVAL}s\n\n"
-    msg += f"*TRON Events:* {tron_status}\n"
-    msg += f"Last scan: {tron_delay}\n"
-    msg += f"Failures: {health.tron_consecutive_failures}\n"
-    msg += f"Scans: {health.tron_scan_count}\n\n"
-    msg += f"*ETH MULTISIG:* {eth_multisig_status}\n"
+    msg += f"*ETH BLOCKS:* {eth_block_status}\n"
+    msg += f"Head: {health.eth_block_last_number or 'n/a'}\n"
+    msg += f"Source: `{health.eth_block_source or 'starting'}`\n"
+    msg += f"Poll: {ETH_BLOCK_POLL_INTERVAL}s | Detections: {health.eth_block_detections}\n"
+    msg += f"Failures: {health.eth_block_consecutive_failures}\n\n"
+    msg += f"*ETH HTTP FALLBACK:* {eth_multisig_status}\n"
     msg += f"Scans: {health.eth_multisig_scan_count}\n"
     msg += f"Failures: {health.eth_multisig_consecutive_failures}\n"
-    msg += f"Interval: {ETH_MULTISIG_SCAN_INTERVAL}s\n\n"
-    msg += f"*ETH MEMPOOL:* {eth_mempool_status}\n"
-    msg += f"Scans: {health.eth_mempool_scan_count}\n"
-    msg += f"Failures: {health.eth_mempool_consecutive_failures}\n"
-    msg += f"Interval: 1s (Alchemy)\n\n"
-    msg += f"*ETH Events:* {eth_status}\n"
-    msg += f"Last scan: {eth_delay}\n"
-    msg += f"Failures: {health.eth_consecutive_failures}\n"
-    msg += f"Scans: {health.eth_scan_count}\n\n"
-    msg += f"*Detection Flow:*\n"
-    msg += f"MultiSig -> Mempool -> Pending -> Confirmed\n\n"
-    msg += f"*Reliability:*\n"
-    msg += f"Auto-synced: {health.total_synced_count} addresses"
+    msg += f"Interval: {ETH_MULTISIG_SCAN_INTERVAL}s\n"
+    msg += f"Last scan: {eth_delay} ({eth_status})\n\n"
+    msg += (
+        "*Detection:* TRON blocks + ETH blocks (in-tx decode), event APIs as fallback"
+    )
 
-    await message.answer(msg, parse_mode="Markdown")
+    try:
+        await message.answer(msg, parse_mode="Markdown")
+    except Exception:
+        await message.answer(msg.replace("*", "").replace("`", ""))
 
 
 @router.message(Command("pending"))
@@ -332,7 +373,9 @@ async def unwatch_cmd(message: Message):
     deleted = database.remove_watchlist(message.chat.id, address, chain)
 
     if deleted:
-        await message.answer(f"Removed `{address}` from watchlist.", parse_mode="Markdown")
+        await message.answer(
+            f"Removed `{address}` from watchlist.", parse_mode="Markdown"
+        )
     else:
         await message.answer("Address not found in your watchlist.")
 
@@ -342,7 +385,9 @@ async def watchlist_cmd(message: Message):
     rows = database.get_user_watchlist(message.chat.id)
 
     if not rows:
-        await message.answer("Your watchlist is empty.\nUse /watch <address> to add addresses.")
+        await message.answer(
+            "Your watchlist is empty.\nUse /watch <address> to add addresses."
+        )
         return
 
     msg = "*Your Watchlist*\n\n"
