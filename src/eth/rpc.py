@@ -1,10 +1,41 @@
+"""Ethereum JSON-RPC via Chainstack (or any ETH_RPC_URL).
+
+ETH has no Tron-style gRPC. The live path is eth_getBlockByNumber and
+decode submit/execute from calldata. Execution logs are fetched only when
+a confirmTransaction is in the block — not full-block receipts.
+"""
+
 from typing import Any, Dict, List, Optional
 
 import httpx
 
-from ..config import ETH_RPC_URL, logger
+from ..config import ETH_RPC_URL, ETH_RPC_URLS, logger
 
 _http: Optional[httpx.AsyncClient] = None
+
+# Endpoint rotation state. A dead Chainstack key answers 403 on every request, so
+# staying on it means every call fails; rotate and stick to whatever answers.
+_urls: list = list(ETH_RPC_URLS) or ([ETH_RPC_URL] if ETH_RPC_URL else [])
+_url_i: int = 0
+rpc_failovers: int = 0
+
+
+def active_rpc_url() -> Optional[str]:
+    return _urls[_url_i] if _urls else None
+
+
+def _rotate_url() -> bool:
+    """Move to the next endpoint. False when there is only one."""
+    global _url_i, rpc_failovers
+    if len(_urls) < 2:
+        return False
+    _url_i = (_url_i + 1) % len(_urls)
+    rpc_failovers += 1
+    host = _urls[_url_i].split("/")[2] if "//" in _urls[_url_i] else _urls[_url_i]
+    logger.warning(
+        f"ETH RPC failing over to endpoint {_url_i + 1}/{len(_urls)}: {host}"
+    )
+    return True
 
 
 async def _client() -> httpx.AsyncClient:
@@ -15,26 +46,50 @@ async def _client() -> httpx.AsyncClient:
 
 
 def rpc_enabled() -> bool:
-    return bool(ETH_RPC_URL)
+    # Any configured endpoint counts: the primary key may be dead while the
+    # fallback still serves, which is the point of the list.
+    return bool(_urls)
 
 
 async def rpc_call(method: str, params: list) -> Any:
-    if not ETH_RPC_URL:
+    """One JSON-RPC call, rotating endpoints on transport/auth failures.
+
+    Rotates on a non-200 (403/401/429 = dead or throttled key) and on transport
+    exceptions. Does NOT rotate on a JSON-RPC `error` body: that is usually a bad
+    request for this method and would be returned by every endpoint, so churning
+    would only add latency. Previously this raised on connect errors instead of
+    returning None, which left callers to handle it inconsistently.
+    """
+    if not _urls:
         return None
     client = await _client()
-    resp = await client.post(
-        ETH_RPC_URL,
-        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-        headers={"Content-Type": "application/json"},
-    )
-    if resp.status_code != 200:
-        logger.warning(f"ETH RPC {method} HTTP {resp.status_code}")
-        return None
-    payload = resp.json()
-    if payload.get("error"):
-        logger.warning(f"ETH RPC {method} error: {payload['error']}")
-        return None
-    return payload.get("result")
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+
+    for _ in range(max(1, len(_urls))):
+        url = _urls[_url_i]
+        try:
+            resp = await client.post(
+                url, json=body, headers={"Content-Type": "application/json"}
+            )
+        except Exception as e:
+            logger.warning(f"ETH RPC {method} transport error: {type(e).__name__}: {e}")
+            if _rotate_url():
+                continue
+            return None
+
+        if resp.status_code != 200:
+            logger.warning(f"ETH RPC {method} HTTP {resp.status_code}")
+            if _rotate_url():
+                continue
+            return None
+
+        payload = resp.json()
+        if payload.get("error"):
+            logger.warning(f"ETH RPC {method} error: {payload['error']}")
+            return None
+        return payload.get("result")
+
+    return None
 
 
 def _normalize_tx(tx: dict) -> Optional[Dict[str, Any]]:
@@ -77,9 +132,7 @@ async def get_eth_block_number() -> Optional[int]:
     return int(result, 16)
 
 
-async def get_eth_block_by_num(
-    block_num: int, full_txs: bool = True
-) -> Optional[Dict[str, Any]]:
+async def get_eth_block_by_num(block_num: int, full_txs: bool = True) -> Optional[Dict[str, Any]]:
     raw = await rpc_call("eth_getBlockByNumber", [hex(block_num), full_txs])
     return _normalize_block(raw) if raw else None
 

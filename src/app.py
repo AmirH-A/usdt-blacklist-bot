@@ -9,6 +9,7 @@ from .config import (
     WEBHOOK_SECRET,
     ENABLE_TRON,
     ENABLE_ETH,
+    ENABLE_ETH_MEMPOOL,
     TRON_USDT_CONTRACT,
     ETH_USDT_CONTRACT,
     TRON_MULTISIG_WALLET,
@@ -25,6 +26,8 @@ from .listeners import (
     listen_to_multisig_submissions,
     listen_to_eth_blocks,
     listen_to_eth_multisig_submissions,
+    listen_to_eth_mempool,
+    reap_eth_phantom_submissions,
 )
 from .eth.rpc import rpc_enabled
 
@@ -43,6 +46,10 @@ def _start_listeners():
             logger.warning("ETH_RPC_URL unset; ETH live path is Etherscan only")
         tasks.append(asyncio.create_task(listen_to_eth_multisig_submissions()))
         logger.info("ETH MultiSig Etherscan fallback started (Submission + Execution)")
+        if ENABLE_ETH_MEMPOOL:
+            tasks.append(asyncio.create_task(listen_to_eth_mempool()))
+            tasks.append(asyncio.create_task(reap_eth_phantom_submissions()))
+            logger.info("ETH mempool pre-block watcher started (+ phantom reaper)")
 
     chains = []
     if ENABLE_TRON:
@@ -140,6 +147,19 @@ async def health_endpoint():
                 "detections": health.eth_block_detections,
                 "source": health.eth_block_source,
                 "healthy": health.eth_block_consecutive_failures < MAX_CONSECUTIVE_FAILURES,
+            },
+            "eth_mempool": {
+                "enabled": ENABLE_ETH_MEMPOOL,
+                "connected": health.eth_mempool_connected,
+                "seen": health.eth_mempool_scan_count,
+                "detections": health.eth_mempool_detections,
+                "reaped": health.eth_mempool_reaped,
+                "last_seen_at": health.eth_mempool_last_seen_at,
+                "failures": health.eth_mempool_consecutive_failures,
+                "healthy": (
+                    not ENABLE_ETH_MEMPOOL
+                    or health.eth_mempool_consecutive_failures < MAX_CONSECUTIVE_FAILURES
+                ),
             },
             "eth_multisig_fallback": {
                 "scans": health.eth_multisig_scan_count,

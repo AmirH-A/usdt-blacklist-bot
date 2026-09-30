@@ -160,7 +160,7 @@ async def broadcast_alert(
         msg += f"*Balance frozen:* {balance_text}\n"
         msg += f"*Confirmed:* {now_str}\n"
         if elapsed_seconds is not None:
-            msg += f"*Time to confirm:* {format_elapsed_time(elapsed_seconds)}\n"
+            msg += f"*Redemption time:* {format_elapsed_time(elapsed_seconds)}\n"
         msg += f"\nAddress officially blacklisted. USDT transfers frozen.\n\n"
         msg += f"[View on {explorer_name}]({explorer_link})"
 
@@ -284,6 +284,14 @@ def _pending_entry(index: int, item: dict[str, Any], show_action: bool) -> str:
     return line
 
 
+def _confirmed_entry(index: int, item: dict[str, Any]) -> str:
+    line = _pending_entry(index, item, show_action=False)
+    elapsed_seconds = item.get("elapsed_seconds")
+    if elapsed_seconds is not None:
+        line += f"\n*Redemption time:* {format_elapsed_time(elapsed_seconds)}"
+    return line
+
+
 def _pending_batch_chunks(items: Sequence[dict[str, Any]]) -> list[str]:
     """One (or few) Telegram messages for every pending in the same block."""
     chain = items[0].get("chain") or "TRON"
@@ -362,7 +370,7 @@ def _confirmed_message(
     msg += f"*Balance frozen:* {balance_text}\n"
     msg += f"*Confirmed:* {time_str}\n"
     if elapsed_seconds is not None:
-        msg += f"*Time to confirm:* {format_elapsed_time(elapsed_seconds)}\n"
+            msg += f"*Redemption time:* {format_elapsed_time(elapsed_seconds)}\n"
     msg += f"\nAddress officially blacklisted. USDT transfers frozen.\n\n"
     msg += f"[View on {explorer_name}]({explorer_link})"
     return msg
@@ -381,7 +389,7 @@ def _confirmed_batch_chunks(items: Sequence[dict[str, Any]]) -> list[str]:
     chunks: list[str] = []
     current = header
     for i, item in enumerate(items, 1):
-        entry = _pending_entry(i, item, show_action=False)
+        entry = _confirmed_entry(i, item)
         extra = ("\n\n" if current != header else "") + entry
         if len(current) + len(extra) > _TELEGRAM_LIMIT and current != header:
             chunks.append(current)

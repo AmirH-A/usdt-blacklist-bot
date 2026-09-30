@@ -16,6 +16,7 @@ from ..config import (
     TRON_USDT_CONTRACT,
     SUBMIT_TRANSACTION_SELECTOR,
     EXECUTE_TRANSACTION_SELECTOR,
+    CONFIRM_TRANSACTION_SELECTOR,
     ADDBLACKLIST_SELECTOR,
     REMOVEBLACKLIST_SELECTOR,
     logger,
@@ -93,6 +94,14 @@ def decode_multisig_submit_data(data: str) -> Optional[dict]:
 
 
 def decode_execute_transaction_data(data: str) -> Optional[int]:
+    return _decode_uint256_call(data, EXECUTE_TRANSACTION_SELECTOR)
+
+
+def decode_confirm_transaction_data(data: str) -> Optional[int]:
+    return _decode_uint256_call(data, CONFIRM_TRANSACTION_SELECTOR)
+
+
+def _decode_uint256_call(data: str, selector: str) -> Optional[int]:
     try:
         if not data:
             return None
@@ -100,7 +109,7 @@ def decode_execute_transaction_data(data: str) -> Optional[int]:
             data = data[2:]
         if len(data) < 72:
             return None
-        if data[:8].lower() != EXECUTE_TRANSACTION_SELECTOR:
+        if data[:8].lower() != selector.lower():
             return None
         return int(data[8:72], 16)
     except Exception:

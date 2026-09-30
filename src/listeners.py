@@ -2,6 +2,8 @@ import asyncio
 from datetime import datetime, timezone
 
 from .config import (
+    ETH_MEMPOOL_REAP_INTERVAL,
+    ETH_MEMPOOL_STALE_S,
     MAX_ALERTS_PER_CYCLE,
     MAX_CONSECUTIVE_FAILURES,
     MULTISIG_SCAN_INTERVAL,
@@ -20,7 +22,6 @@ from .bot.alerts import (
 from .tron import (
     decode_multisig_submit_data,
     get_multisig_submission_events,
-    get_multisig_execution_events,
     get_multisig_tx_details,
 )
 from .tron.block_watcher import BlockCursor, extract_multisig_ops
@@ -98,6 +99,14 @@ async def _handle_block_ops(ops: list, chain: str):
                 block_timestamp=op["block_timestamp"],
                 multisig_tx_id=op.get("multisig_tx_id"),
             )
+            if not is_new and op.get("block_timestamp"):
+                if database.backfill_submission_block(
+                    chain, op["tx_hash"], op["block_timestamp"]
+                ):
+                    logger.info(
+                        f"{chain} BLOCK backfilled mempool submission "
+                        f"{op['target_address']} ({op['tx_hash'][:16]}...)"
+                    )
             if is_new:
                 if chain == "TRON":
                     health.block_detections += 1
@@ -105,7 +114,8 @@ async def _handle_block_ops(ops: list, chain: str):
                     health.eth_block_detections += 1
                 logger.info(
                     f"{chain} BLOCK {op['action'].upper()}: {op['target_address']} "
-                    f"(block {op['block_number']}, {op['tx_hash'][:16]}...)"
+                    f"(block {op['block_number']}, tx #{op.get('multisig_tx_id') or 0}, "
+                    f"{op['tx_hash'][:16]}...)"
                 )
                 pending_alerts.append(op)
         elif op["kind"] == "execution":
@@ -335,25 +345,8 @@ async def listen_to_multisig_submissions():
                         "TRON", event["tx_hash"], event["transaction_id"]
                     )
 
-            exec_events = await get_multisig_execution_events()
-            confirmed = []
-            for exec_event in exec_events:
-                marked = database.mark_multisig_executed(
-                    "TRON",
-                    exec_tx_id=exec_event["transaction_id"],
-                    exec_tx_hash=exec_event.get("tx_hash", ""),
-                    confirmed_block_timestamp=exec_event.get("block_timestamp"),
-                )
-                if marked:
-                    confirmed.append((marked, exec_event))
-
-            if confirmed:
-                await broadcast_confirmed_alerts(
-                    [
-                        _confirmed_item(marked, event, "TRON")
-                        for marked, event in confirmed
-                    ]
-                )
+            # Confirms are decoded from blocks (confirmTransaction / executeTransaction).
+            # Do not poll TronGrid Execution events for TRON.
 
             health.multisig_consecutive_failures = 0
             await asyncio.sleep(MULTISIG_SCAN_INTERVAL)
@@ -504,3 +497,29 @@ async def listen_to_eth_multisig_submissions():
             if health.eth_multisig_consecutive_failures == MAX_CONSECUTIVE_FAILURES:
                 await _notify_scanner_down("ETH MULTISIG", e)
             await asyncio.sleep(10)
+
+
+async def listen_to_eth_mempool():
+    """Pre-block ETH detection. Feeds the same op pipeline as the block watcher."""
+    from .eth.mempool import listen_to_eth_mempool as _stream
+
+    await _stream(_handle_block_ops)
+
+
+async def reap_eth_phantom_submissions():
+    """Remove mempool submissions that never landed in a block."""
+    while True:
+        try:
+            await asyncio.sleep(ETH_MEMPOOL_REAP_INTERVAL)
+            dropped = database.reap_phantom_submissions("ETH", ETH_MEMPOOL_STALE_S)
+            for row in dropped:
+                health.eth_mempool_reaped += 1
+                logger.warning(
+                    f"ETH mempool phantom reaped: {row['action']} -> "
+                    f"{row['target_address']} never mined "
+                    f"({(row['tx_hash'] or '')[:16]}...)"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"ETH phantom reaper error: {e}")
