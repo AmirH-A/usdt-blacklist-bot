@@ -12,10 +12,16 @@ from ..config import (
     CHAINSTACK_GRPC_HOST,
     CHAINSTACK_GRPC_PORT,
     CHAINSTACK_API_TOKEN,
+    TRON_GRPC_ENDPOINTS,
     USE_GRPC,
 )
 
 _executor = ThreadPoolExecutor(max_workers=4)
+
+# `except grpc.RpcError` raises AttributeError when grpcio is not installed
+# (grpc is None), turning a missing dependency into a confusing crash inside the
+# error handler. An empty tuple catches nothing and falls through to Exception.
+_RPC_ERRORS = (grpc.RpcError,) if grpc else ()
 
 
 def decode_varint(data: bytes, pos: int) -> tuple:
@@ -207,7 +213,9 @@ def parse_trigger_smart_contract(data: bytes) -> Dict[str, Any]:
 
 
 def grpc_available() -> bool:
-    return bool(grpc) and USE_GRPC and bool(CHAINSTACK_API_TOKEN)
+    # Any configured endpoint will do -- the primary token may be dead while a
+    # fallback still works, which is the whole point of the endpoint list.
+    return bool(grpc) and USE_GRPC and bool(TRON_GRPC_ENDPOINTS or CHAINSTACK_API_TOKEN)
 
 
 class TronGrpcClient:
@@ -218,11 +226,22 @@ class TronGrpcClient:
         port: int = None,
         api_token: str = None,
     ):
-        self.host = host or CHAINSTACK_GRPC_HOST
-        self.port = port or CHAINSTACK_GRPC_PORT
-        self.api_token = api_token or CHAINSTACK_API_TOKEN
+        if host or api_token:
+            # Explicit single endpoint (tests, one-off probes): no failover.
+            self._endpoints = [(
+                host or CHAINSTACK_GRPC_HOST,
+                port or CHAINSTACK_GRPC_PORT,
+                api_token or CHAINSTACK_API_TOKEN,
+            )]
+        else:
+            self._endpoints = list(TRON_GRPC_ENDPOINTS) or [(
+                CHAINSTACK_GRPC_HOST, CHAINSTACK_GRPC_PORT, CHAINSTACK_API_TOKEN,
+            )]
+        self._ep_index = 0
+        self.host, self.port, self.api_token = self._endpoints[0]
         self._channel = None
         self._initialized = False
+        self.failovers = 0          # surfaced for /health
 
     def _init_channel(self):
         """Initialize gRPC channel with authentication."""
@@ -262,6 +281,58 @@ class TronGrpcClient:
             logger.error(f"gRPC init failed: {e}")
             raise
 
+    def _switch_endpoint(self) -> bool:
+        """Advance to the next endpoint. False when there is nowhere to go."""
+        if len(self._endpoints) < 2:
+            return False
+        self._ep_index = (self._ep_index + 1) % len(self._endpoints)
+        self.host, self.port, self.api_token = self._endpoints[self._ep_index]
+        if self._channel:
+            try:
+                self._channel.close()
+            except Exception:
+                pass
+        self._channel = None
+        self._initialized = False
+        self.failovers += 1
+        logger.warning(
+            f"TRON gRPC failing over to endpoint {self._ep_index + 1}"
+            f"/{len(self._endpoints)}: {self.host}:{self.port}"
+        )
+        return True
+
+    def _invoke(self, path, payload, parser, timeout=5, empty_is_failure=False):
+        """Call one unary method, failing over across endpoints.
+
+        empty_is_failure: set for calls whose result must exist (the chain head).
+        A dead token answers 200-at-the-transport but yields nothing useful, so
+        "no data" has to count as a failure or we never leave a broken endpoint.
+        Left False for lookups where None legitimately means "not found".
+        """
+        attempts = max(1, len(self._endpoints))
+        for _ in range(attempts):
+            reason = None
+            try:
+                self._init_channel()
+                method = self._channel.unary_unary(
+                    path,
+                    request_serializer=lambda x: x,
+                    response_deserializer=lambda x: x,
+                )
+                result = parser(method(payload, timeout=timeout))
+                if result is not None or not empty_is_failure:
+                    return result
+                reason = "returned no data"
+            except _RPC_ERRORS as e:
+                reason = f"{e.code()} - {e.details()}"
+            except Exception as e:
+                reason = f"{type(e).__name__}: {e}"
+
+            logger.error(f"gRPC {path} via {self.host}:{self.port} -> {reason}")
+            if not self._switch_endpoint():
+                break
+        return None
+
     def close(self):
         if self._channel:
             self._channel.close()
@@ -289,73 +360,32 @@ class TronGrpcClient:
         return bytes(result)
 
     def get_now_block(self) -> Optional[Dict[str, Any]]:
-
-        self._init_channel()
-
-        try:
-            method = self._channel.unary_unary(
-                "/protocol.Wallet/GetNowBlock2",
-                request_serializer=lambda x: x,
-                response_deserializer=lambda x: x,
-            )
-
-            response = method(b"", timeout=5)
-            return parse_block_extension(response)
-
-        except grpc.RpcError as e:
-            logger.error(f"gRPC GetNowBlock2 error: {e.code()} - {e.details()}")
-            return None
-        except Exception as e:
-            logger.error(f"GetNowBlock2 exception: {e}")
-            return None
+        # The chain head always exists: None here means this endpoint is broken
+        # (expired token answers PERMISSION_DENIED), so fail over.
+        return self._invoke(
+            "/protocol.Wallet/GetNowBlock2", b"", parse_block_extension,
+            empty_is_failure=True,
+        )
 
     def get_block_by_num(self, block_num: int) -> Optional[Dict[str, Any]]:
         """Get block by number."""
-        self._init_channel()
-
-        try:
-            method = self._channel.unary_unary(
-                "/protocol.Wallet/GetBlockByNum2",
-                request_serializer=lambda x: x,
-                response_deserializer=lambda x: x,
-            )
-
-            request = self._encode_number_message(block_num)
-            response = method(request, timeout=5)
-            return parse_block_extension(response)
-
-        except grpc.RpcError as e:
-            logger.error(f"gRPC GetBlockByNum2 error: {e.code()}")
-            return None
-        except Exception as e:
-            logger.error(f"GetBlockByNum2 exception: {e}")
-            return None
+        # A block we asked for by number should exist, so empty = unhealthy.
+        return self._invoke(
+            "/protocol.Wallet/GetBlockByNum2",
+            self._encode_number_message(block_num),
+            parse_block_extension,
+            empty_is_failure=True,
+        )
 
     def get_transaction_by_id(self, tx_hash: str) -> Optional[Dict[str, Any]]:
         """Get transaction by hash."""
-        self._init_channel()
-
-        try:
-            method = self._channel.unary_unary(
-                "/protocol.Wallet/GetTransactionById",
-                request_serializer=lambda x: x,
-                response_deserializer=lambda x: x,
-            )
-
-            tx_bytes = bytes.fromhex(tx_hash)
-            request = self._encode_bytes_message(tx_bytes)
-            response = method(request, timeout=5)
-
-            if response:
-                return parse_transaction_inner(response)
-            return None
-
-        except grpc.RpcError as e:
-            logger.error(f"gRPC GetTransactionById error: {e.code()}")
-            return None
-        except Exception as e:
-            logger.error(f"GetTransactionById exception: {e}")
-            return None
+        # None can legitimately mean "no such tx", so do NOT fail over on empty;
+        # only transport errors rotate the endpoint.
+        return self._invoke(
+            "/protocol.Wallet/GetTransactionById",
+            self._encode_bytes_message(bytes.fromhex(tx_hash)),
+            lambda r: parse_transaction_inner(r) if r else None,
+        )
 
 
 _grpc_client: Optional[TronGrpcClient] = None

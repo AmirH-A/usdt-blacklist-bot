@@ -53,7 +53,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS subscribers (
             chat_id INTEGER PRIMARY KEY,
-            subscribed_at TEXT DEFAULT CURRENT_TIMESTAMP
+            subscribed_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
         )
     """
     )
@@ -64,7 +64,7 @@ def init_db():
             address TEXT NOT NULL,
             chain TEXT NOT NULL DEFAULT 'TRON',
             status TEXT NOT NULL DEFAULT 'pending',
-            detected_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            detected_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
             confirmed_at TEXT,
             tx_hash TEXT,
             alerted INTEGER DEFAULT 0,
@@ -90,7 +90,7 @@ def init_db():
             chat_id INTEGER NOT NULL,
             address TEXT NOT NULL,
             chain TEXT NOT NULL,
-            added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            added_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
             PRIMARY KEY (chat_id, address, chain)
         )
     """
@@ -104,7 +104,7 @@ def init_db():
             target_address TEXT NOT NULL,
             action TEXT NOT NULL,
             submission_tx_hash TEXT,
-            submitted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            submitted_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
             submission_block_timestamp INTEGER,
             executed INTEGER DEFAULT 0,
             executed_at TEXT,
@@ -217,7 +217,7 @@ def record_multisig_submission(
             """INSERT OR IGNORE INTO multisig_pending
                (tx_id, chain, target_address, action, submission_tx_hash,
                 submitted_at, submission_block_timestamp, alerted)
-               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 0)""",
+               VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%d %H:%M:%f','now'), ?, 0)""",
             (multisig_tx_id, chain, target_address, action, tx_hash, block_timestamp),
         )
         if cursor.rowcount == 0:
@@ -233,12 +233,92 @@ def record_multisig_submission(
                 cursor.execute(
                     """INSERT INTO blacklist
                        (address, chain, status, tx_hash, alerted, detected_at, block_timestamp)
-                       VALUES (?, ?, 'multisig_pending', ?, 1, CURRENT_TIMESTAMP, ?)""",
+                       VALUES (?, ?, 'multisig_pending', ?, 1, strftime('%Y-%m-%d %H:%M:%f','now'), ?)""",
                     (target_address, chain, tx_hash, block_timestamp),
                 )
 
         conn.commit()
         return True
+    finally:
+        conn.close()
+
+
+def backfill_submission_block(
+    chain: str,
+    tx_hash: str,
+    block_timestamp: Optional[int],
+) -> bool:
+    """Attach the real block timestamp to a row first seen in the mempool.
+
+    Deliberately never touches detected_at: that column holds the *earliest*
+    sighting, which is the whole point of pre-block detection. Only fills where
+    the timestamp is still missing, so a block replay cannot rewrite history.
+    """
+    if not tx_hash or not block_timestamp:
+        return False
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """UPDATE multisig_pending
+               SET submission_block_timestamp = ?
+               WHERE chain = ? AND submission_tx_hash = ?
+                 AND (submission_block_timestamp IS NULL OR submission_block_timestamp = 0)""",
+            (block_timestamp, chain, tx_hash),
+        )
+        touched = cursor.rowcount
+        cursor.execute(
+            """UPDATE blacklist
+               SET block_timestamp = ?
+               WHERE chain = ? AND tx_hash = ?
+                 AND (block_timestamp IS NULL OR block_timestamp = 0)""",
+            (block_timestamp, chain, tx_hash),
+        )
+        touched += cursor.rowcount
+        conn.commit()
+        return touched > 0
+    finally:
+        conn.close()
+
+
+def reap_phantom_submissions(chain: str, max_age_s: int) -> list:
+    """Drop mempool-only submissions that never made it into a block.
+
+    A pending tx can be dropped or replaced, so a submission still carrying no
+    block timestamp after max_age_s never happened on-chain. Returns the rows
+    removed so the caller can log them.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """SELECT tx_id, target_address, action, submission_tx_hash
+               FROM multisig_pending
+               WHERE chain = ?
+                 AND executed = 0
+                 AND (submission_block_timestamp IS NULL OR submission_block_timestamp = 0)
+                 AND submitted_at < datetime('now', ?)""",
+            (chain, f"-{int(max_age_s)} seconds"),
+        )
+        rows = [
+            {"tx_id": r[0], "target_address": r[1], "action": r[2], "tx_hash": r[3]}
+            for r in cursor.fetchall()
+        ]
+        for r in rows:
+            cursor.execute(
+                "DELETE FROM multisig_pending WHERE tx_id = ? AND chain = ?",
+                (r["tx_id"], chain),
+            )
+            # Only remove the blacklist row if it is still unconfirmed. If the
+            # block watcher confirmed it by another tx hash, leave it alone.
+            cursor.execute(
+                """DELETE FROM blacklist
+                   WHERE chain = ? AND address = ? AND status = 'multisig_pending'
+                     AND (block_timestamp IS NULL OR block_timestamp = 0)""",
+                (chain, r["target_address"]),
+            )
+        conn.commit()
+        return rows
     finally:
         conn.close()
 
@@ -281,7 +361,7 @@ def mark_multisig_executed(
         target_address, action, submission_tx_hash, submitted_ts = row[:4]
         cursor.execute(
             """UPDATE multisig_pending
-               SET executed = 1, executed_at = CURRENT_TIMESTAMP
+               SET executed = 1, executed_at = strftime('%Y-%m-%d %H:%M:%f','now')
                WHERE tx_id = ? AND chain = ?""",
             (exec_tx_id, chain),
         )
@@ -289,7 +369,7 @@ def mark_multisig_executed(
         new_status = "confirmed" if action == "blacklist" else "unfrozen"
         cursor.execute(
             """UPDATE blacklist
-               SET status = ?, confirmed_at = CURRENT_TIMESTAMP, tx_hash = ?,
+               SET status = ?, confirmed_at = strftime('%Y-%m-%d %H:%M:%f','now'), tx_hash = ?,
                    alerted = 1, confirmed_block_timestamp = ?
                WHERE address = ? AND chain = ?""",
             (

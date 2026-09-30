@@ -17,6 +17,17 @@ ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "")
 ALCHEMY_WSS_URL = f"wss://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 ALCHEMY_HTTP_URL = f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 
+# --- ETH mempool (pre-block) detection ---
+# ETH blocks are only servable ~2s after their slot timestamp (propagation),
+# so block-based detection has a hard ~2s floor. The mempool sees the tx before
+# any block contains it. Off by default: enable per-deployment.
+ENABLE_ETH_MEMPOOL = os.getenv("ENABLE_ETH_MEMPOOL", "false").lower() == "true"
+ETH_MEMPOOL_WSS_URL = os.getenv("ETH_MEMPOOL_WSS_URL", ALCHEMY_WSS_URL)
+# A pending submission that never gets mined is a phantom; reap it after this.
+ETH_MEMPOOL_STALE_S = int(os.getenv("ETH_MEMPOOL_STALE_S", "900"))
+ETH_MEMPOOL_REAP_INTERVAL = int(os.getenv("ETH_MEMPOOL_REAP_INTERVAL", "120"))
+
+
 ENABLE_TRON = os.getenv("ENABLE_TRON", "true").lower() == "true"
 ENABLE_ETH = os.getenv("ENABLE_ETH", "true").lower() == "true"
 
@@ -31,13 +42,88 @@ CHAINSTACK_GRPC_PORT = int(os.getenv("CHAINSTACK_GRPC_PORT", "443"))
 CHAINSTACK_API_TOKEN = os.getenv("CHAINSTACK_API_TOKEN", "")
 USE_GRPC = os.getenv("USE_GRPC", "true").lower() == "true"
 
+# Secondary Chainstack TRON gRPC endpoint. The primary can go dead without the
+# bot noticing: an expired token answers every call with PERMISSION_DENIED /
+# http2 403, get_now_block returns None, and the watcher quietly degrades to the
+# slower TronGrid HTTP path. Configure a second endpoint and the client fails
+# over instead. Token lives in .env, never in the repo.
+CHAINSTACK_GRPC_HOST_FALLBACK = os.getenv(
+    "CHAINSTACK_GRPC_HOST_FALLBACK", "tron-mainnet.core.chainstack.com"
+)
+CHAINSTACK_GRPC_PORT_FALLBACK = int(os.getenv("CHAINSTACK_GRPC_PORT_FALLBACK", "443"))
+CHAINSTACK_API_TOKEN_FALLBACK = os.getenv("CHAINSTACK_API_TOKEN_FALLBACK", "")
+
+
+def _tron_grpc_endpoints() -> list:
+    """Ordered (host, port, token); primary first, then any fallback."""
+    eps = []
+    if CHAINSTACK_API_TOKEN:
+        eps.append((CHAINSTACK_GRPC_HOST, CHAINSTACK_GRPC_PORT, CHAINSTACK_API_TOKEN))
+    if CHAINSTACK_API_TOKEN_FALLBACK:
+        eps.append((
+            CHAINSTACK_GRPC_HOST_FALLBACK,
+            CHAINSTACK_GRPC_PORT_FALLBACK,
+            CHAINSTACK_API_TOKEN_FALLBACK,
+        ))
+    return eps
+
+
+TRON_GRPC_ENDPOINTS = _tron_grpc_endpoints()
+
 ETH_USDT_CONTRACT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
 ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
 ETH_CHAIN_ID = 1
 ETH_RPC_URL = os.getenv("ETH_RPC_URL", "").rstrip("/")
 ETH_BLOCK_POLL_INTERVAL = float(os.getenv("ETH_BLOCK_POLL_INTERVAL", "1.0"))
+
+# Secondary ETH JSON-RPC endpoint, same reasoning as the TRON gRPC fallback: a
+# lapsed Chainstack key answers 403 on every call, rpc_call returns None, and the
+# block watcher silently degrades to the 3s Etherscan path with nothing alerting.
+# Both of this project's Chainstack keys died within two days of each other.
+ETH_RPC_URL_FALLBACK = os.getenv("ETH_RPC_URL_FALLBACK", "").rstrip("/")
+
+
+def _eth_rpc_urls() -> list:
+    """Ordered RPC URLs; the existing env value stays primary."""
+    urls = [u for u in (ETH_RPC_URL, ETH_RPC_URL_FALLBACK) if u]
+    seen, out = set(), []
+    for u in urls:                      # keep order, drop duplicates
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+ETH_RPC_URLS = _eth_rpc_urls()
+
+# Mempool sources, raced first-seen-wins. Measured on this box: Chainstack sees a
+# pending tx ~449ms before Alchemy (238/250 shared hashes), while Alchemy is the
+# only one offering a server-side toAddress filter. Running both takes the
+# earlier of the two and survives one provider stalling. Rejecting a non-match
+# costs 0.0002ms, so client-side filtering the unfiltered stream is free.
+def _default_mempool_urls() -> list:
+    # Derive from EVERY configured RPC endpoint, not just the primary. When the
+    # primary key died its WSS answered "server rejected WebSocket connection:
+    # HTTP 403" every few seconds while the healthy fallback sat unused.
+    urls = []
+    if ALCHEMY_API_KEY:
+        urls.append(ALCHEMY_WSS_URL)
+    for u in ETH_RPC_URLS:
+        if u.startswith("http"):
+            urls.append(u.replace("https://", "wss://").replace("http://", "ws://"))
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+ETH_MEMPOOL_WSS_URLS = [
+    u.strip() for u in os.getenv("ETH_MEMPOOL_WSS_URLS", "").split(",") if u.strip()
+] or _default_mempool_urls()
 ETH_BLOCK_CATCHUP_CONCURRENCY = int(os.getenv("ETH_BLOCK_CATCHUP_CONCURRENCY", "4"))
-ETH_BLOCK_MAX_CATCHUP = int(os.getenv("ETH_BLOCK_MAX_CATCHUP", "20"))
+ETH_BLOCK_MAX_CATCHUP = int(os.getenv("ETH_BLOCK_MAX_CATCHUP", "80"))
 ETH_BLACKLIST_TOPIC = (
     "0x42e160154868087d6bfdc0ca23d96a1c1cfa32f1b72ba9ba27b69b98a0d819dc"
 )

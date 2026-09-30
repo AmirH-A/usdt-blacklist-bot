@@ -5,13 +5,16 @@ from typing import Any, Dict, List, Optional
 from ..config import (
     logger,
     TRON_MULTISIG_HEX,
-    BLOCK_POLL_INTERVAL,
     BLOCK_CATCHUP_CONCURRENCY,
     BLOCK_MAX_CATCHUP,
 )
 from .. import database, health
 from .blocks import get_now_block, get_block_by_num
-from .multisig import decode_multisig_submit_data, decode_execute_transaction_data
+from .multisig import (
+    decode_multisig_submit_data,
+    decode_execute_transaction_data,
+    decode_confirm_transaction_data,
+)
 
 MULTISIG_HEX = (
     TRON_MULTISIG_HEX[2:] if TRON_MULTISIG_HEX.startswith("41") else TRON_MULTISIG_HEX
@@ -54,6 +57,8 @@ def extract_multisig_ops(block: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
 
         exec_id = decode_execute_transaction_data(data)
+        if exec_id is None:
+            exec_id = decode_confirm_transaction_data(data)
         if exec_id is not None:
             ops.append(
                 {

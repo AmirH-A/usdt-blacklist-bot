@@ -11,6 +11,7 @@ from .api import (
 from .multisig import (
     decode_multisig_submit_data,
     decode_execute_transaction_data,
+    decode_confirm_transaction_data,
     get_multisig_submission_events,
     get_multisig_execution_events,
     get_multisig_tx_details,

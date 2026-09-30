@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from ..config import (
     logger,
     ETH_MULTISIG_WALLET,
+    ETH_SUBMISSION_TOPIC,
     ETH_EXECUTION_TOPIC,
     ETH_BLOCK_CATCHUP_CONCURRENCY,
     ETH_BLOCK_MAX_CATCHUP,
@@ -15,6 +16,7 @@ from .multisig import (
     decode_eth_submit_input,
     decode_eth_execute_input,
     decode_eth_confirm_input,
+    submission_id_from_logs,
     execution_id_from_logs,
 )
 
@@ -48,7 +50,10 @@ def extract_eth_multisig_ops(block: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
             continue
 
+        # Finalizes are usually confirmTransaction; executeTransaction is rarer.
         exec_id = decode_eth_execute_input(data)
+        if exec_id is None:
+            exec_id = decode_eth_confirm_input(data)
         if exec_id is not None:
             ops.append(
                 {
@@ -63,13 +68,23 @@ def extract_eth_multisig_ops(block: Dict[str, Any]) -> List[Dict[str, Any]]:
     return ops
 
 
-def _block_has_confirm(block: Dict[str, Any]) -> bool:
-    for tx in block.get("transactions") or []:
-        if (tx.get("to") or "") != MULTISIG:
+def _block_has_kind(ops: List[Dict[str, Any]], kind: str) -> bool:
+    return any(op.get("kind") == kind for op in ops)
+
+
+def _ids_by_tx_hash_from_logs(
+    logs: List[Dict[str, Any]],
+    id_from_logs,
+) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for log in logs or []:
+        tx_hash = (log.get("transactionHash") or "").lower()
+        if not tx_hash:
             continue
-        if decode_eth_confirm_input(tx.get("data") or "") is not None:
-            return True
-    return False
+        sid = id_from_logs([log])
+        if sid is not None:
+            out[tx_hash] = sid
+    return out
 
 
 def _executions_from_logs(
@@ -99,25 +114,59 @@ def _executions_from_logs(
 
 
 async def ops_from_eth_block(block: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Decode Multisig ops from the block; attach real Submission ids from logs.
+
+    Same-block submit+confirm used to miss confirms because pending was stored with a
+    hash-prefix placeholder id, while Execution/confirm carry the real Multisig id.
+    Fetching Submission logs for this block binds the real id before we record pending.
+    """
     ops = extract_eth_multisig_ops(block)
-    if not _block_has_confirm(block):
+    if not ops:
         return ops
 
-    logs = await get_eth_logs(
-        ETH_MULTISIG_WALLET,
-        ETH_EXECUTION_TOPIC,
-        block["block_number"],
-    )
-    seen = {
-        (op.get("multisig_tx_id"), (op.get("tx_hash") or "").lower())
-        for op in ops
-        if op.get("kind") == "execution"
-    }
-    for op in _executions_from_logs(logs, block):
-        key = (op.get("multisig_tx_id"), (op.get("tx_hash") or "").lower())
-        if key not in seen:
-            ops.append(op)
-            seen.add(key)
+    block_num = block["block_number"]
+    has_submission = _block_has_kind(ops, "submission")
+    has_execution = _block_has_kind(ops, "execution")
+
+    if has_submission:
+        sub_logs = await get_eth_logs(
+            ETH_MULTISIG_WALLET,
+            ETH_SUBMISSION_TOPIC,
+            block_num,
+        )
+        ids_by_hash = _ids_by_tx_hash_from_logs(sub_logs, submission_id_from_logs)
+        for op in ops:
+            if op.get("kind") != "submission":
+                continue
+            real_id = ids_by_hash.get((op.get("tx_hash") or "").lower())
+            if real_id is not None:
+                op["multisig_tx_id"] = real_id
+
+    # Also pull Execution logs when this block finalized anything (confirm/execute),
+    # in case calldata decode missed a path.
+    if has_execution or any(
+        decode_eth_confirm_input(tx.get("data") or "") is not None
+        for tx in (block.get("transactions") or [])
+        if (tx.get("to") or "") == MULTISIG
+    ):
+        exec_logs = await get_eth_logs(
+            ETH_MULTISIG_WALLET,
+            ETH_EXECUTION_TOPIC,
+            block_num,
+        )
+        seen = {
+            (op.get("multisig_tx_id"), (op.get("tx_hash") or "").lower())
+            for op in ops
+            if op.get("kind") == "execution"
+        }
+        for op in _executions_from_logs(exec_logs, block):
+            key = (op.get("multisig_tx_id"), (op.get("tx_hash") or "").lower())
+            if key not in seen:
+                ops.append(op)
+                seen.add(key)
+
+    # Submissions first, then executions — so same-block confirms can match.
+    ops.sort(key=lambda o: 0 if o.get("kind") == "submission" else 1)
     return ops
 
 
@@ -138,8 +187,12 @@ class EthBlockCursor:
     def persist(self):
         if self.last_block:
             database.set_sync_state("eth_watcher_last_block", str(self.last_block))
+            database.set_sync_state("eth_last_block_number", str(self.last_block))
             database.set_sync_state(
                 "eth_watcher_last_scan", datetime.now(timezone.utc).isoformat()
+            )
+            database.set_sync_state(
+                "eth_last_scan", datetime.now(timezone.utc).isoformat()
             )
             health.eth_block_last_number = self.last_block
 
