@@ -1,0 +1,24 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: zarin-fd-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: freeze_detector
+      POSTGRES_USER: fd
+      POSTGRES_PASSWORD: ${FD_DB_PASSWORD}
+      # The detector writes small rows constantly; keep checkpoints cheap.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      # Loopback only. Nothing off-box should reach this.
+      - "127.0.0.1:5435:5432"
+    volumes:
+      - zarin_fd_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fd -d freeze_detector"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  zarin_fd_pgdata:
