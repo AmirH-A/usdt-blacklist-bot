@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -22,6 +23,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
+import psycopg2
+import psycopg2.extras
 
 from .tron.address import tron_address_to_hex
 
@@ -32,7 +35,9 @@ ONCHAIN_SHEET_ID = os.getenv(
     "ONCHAIN_SHEET_ID", "1LBXx04B_w3CqllGpudsKXhy5sC3l9nCvhmQy6U_3dG0"
 )
 ONCHAIN_GID = os.getenv("ONCHAIN_GID", "1543539254")
-BOT_DB_PATH = os.getenv("BOT_DB_PATH", "blacklist_tracker.db")
+BOT_DB_PATH = os.getenv("BOT_DB_PATH", "blacklist_tracker.db")  # legacy, snapshot only
+# The live bot tables moved to postgres; comparison_tracker.db is still sqlite.
+BOT_DSN = os.getenv("DATABASE_URL", "")
 CMP_DB_PATH = os.getenv("CMP_DB_PATH", "comparison_tracker.db")
 SHEET_CACHE_TTL = int(os.getenv("SHEET_CACHE_TTL", "45"))
 REPORT_CACHE_TTL = int(os.getenv("REPORT_CACHE_TTL", "20"))
@@ -52,6 +57,11 @@ TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 ETH_USDT_CONTRACT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
 ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
+
+_log = logging.getLogger("accuracy")
+# Surfaced in the report's `sources` block so a broken query is visible on the
+# panel itself, not only in the journal.
+_query_errors: list[str] = []
 
 _sheet_cache: dict[str, tuple[float, list[dict]]] = {}
 _report_cache: tuple[float, dict] | None = None
@@ -127,6 +137,12 @@ def _ts_ms(value: Any) -> Optional[int]:
     return n
 
 
+def _invert_ts(ts: str) -> tuple:
+    """Sort key that orders timestamp strings newest-first inside an ascending
+    composite key, where `reverse=True` would wrongly invert the other parts."""
+    return tuple(-ord(c) for c in ts)
+
+
 def _redemption_s(start: Any, end: Any) -> Optional[float]:
     a, b = _ts_ms(start), _ts_ms(end)
     if a is None or b is None:
@@ -186,6 +202,44 @@ def _sheet_url(sheet_id: str, gid: str = "0") -> str:
     )
 
 
+class _PgReadConn:
+    """sqlite3-shaped read-only handle on the bot's postgres database.
+
+    Every read in this module goes through _query(conn, sql, args), which calls
+    conn.execute(...).fetchall() and indexes rows both by name and position.
+    DictCursor rows do both, exactly like sqlite3.Row, so none of the eleven
+    queries below needed changing.
+    """
+
+    def __init__(self, dsn: str):
+        self._conn = psycopg2.connect(dsn, connect_timeout=5)
+        # Read-only: this module must never be able to write to the bot's data.
+        self._conn.set_session(readonly=True, autocommit=True)
+
+    def execute(self, sql: str, args: tuple = ()):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        # args or None: psycopg2 skips interpolation entirely when params are
+        # None, so a bare % in SQL cannot be mistaken for a placeholder.
+        cur.execute(sql.replace("?", "%s"), args or None)
+        return cur
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
+def _open_bot_db() -> Optional["_PgReadConn"]:
+    if not BOT_DSN:
+        return None
+    try:
+        return _PgReadConn(BOT_DSN)
+    except psycopg2.Error as e:
+        print(f"accuracy: cannot reach bot postgres: {e}")
+        return None
+
+
 def _open_db(path: str) -> Optional[sqlite3.Connection]:
     if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
         return None
@@ -206,7 +260,11 @@ def _query(
         return []
     try:
         return conn.execute(sql, args).fetchall()
-    except sqlite3.Error:
+    except (sqlite3.Error, psycopg2.Error) as e:
+        # Never silent: a dialect slip here renders a whole panel section
+        # empty, which reads as "no data" rather than "broken query".
+        _log.warning("query failed (%s): %s", type(e).__name__, str(e).strip())
+        _query_errors.append(f"{type(e).__name__}: {str(e).strip()[:200]}")
         return []
 
 
@@ -636,11 +694,12 @@ def _stale_seconds(iso_value: Optional[str]) -> Optional[float]:
 
 def build_report(force: bool = False) -> dict[str, Any]:
     global _report_cache
+    del _query_errors[:]          # per-report; stale errors must not linger
     now = time.time()
     if not force and _report_cache and now - _report_cache[0] < REPORT_CACHE_TTL:
         return _report_cache[1]
 
-    bot = _open_db(BOT_DB_PATH)
+    bot = _open_bot_db()
     cmp = _open_db(CMP_DB_PATH)
     try:
         report = _build_report(bot, cmp)
@@ -713,7 +772,7 @@ def _build_report(
         """SELECT chain, target_address, submission_block_timestamp, executed_at
            FROM multisig_pending
            WHERE executed = 1
-             AND IFNULL(action, 'blacklist') = 'blacklist'
+             AND COALESCE(action, 'blacklist') = 'blacklist'
              AND submission_block_timestamp IS NOT NULL""",
     ):
         chain = (row["chain"] or "TRON").upper()
@@ -922,7 +981,7 @@ def _build_report(
         bot,
         """SELECT chain, target_address, submission_tx_hash, submission_block_timestamp, tx_id
            FROM multisig_pending
-           WHERE IFNULL(action, 'blacklist') = 'blacklist'
+           WHERE COALESCE(action, 'blacklist') = 'blacklist'
              AND submission_block_timestamp IS NOT NULL""",
     ):
         chain = (row["chain"] or "TRON").upper()
@@ -1002,8 +1061,27 @@ def _build_report(
                 ),
             }
         )
+    # Group each freeze's two rows together instead of sorting rows
+    # independently. Execution always lands in a later block than submission,
+    # so a flat newest-first sort placed CONFIRMED above its own PENDING.
+    def _freeze_key(e: dict) -> tuple:
+        return (e.get("chain") or "", (e.get("address") or "").lower())
+
+    _newest: dict[tuple, str] = {}
+    for _e in events:
+        _k = _freeze_key(_e)
+        _ts = _e.get("alert_time") or _e.get("onchain_time") or ""
+        if _ts > _newest.get(_k, ""):
+            _newest[_k] = _ts
+
+    # Undated groups last, newest first, then CONFIRMED above PENDING.
     events.sort(
-        key=lambda e: e.get("alert_time") or e.get("onchain_time") or "", reverse=True
+        key=lambda e: (
+            _newest.get(_freeze_key(e), "") == "",
+            _invert_ts(_newest.get(_freeze_key(e), "")),
+            _freeze_key(e),
+            0 if e.get("status") == "confirmed" else 1,
+        )
     )
 
     bal_by_key, bal_by_addr = _build_balance_index(detections)
@@ -1075,12 +1153,14 @@ def _build_report(
     return {
         "generated_at": _now().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "sources": {
+            # Credentials stripped: this payload is served to the panels.
             "bot_db": (
-                os.path.abspath(BOT_DB_PATH) if os.path.exists(BOT_DB_PATH) else None
+                "postgresql://zarin-fd-db:5435/freeze_detector" if BOT_DSN else None
             ),
             "cmp_db": (
                 os.path.abspath(CMP_DB_PATH) if os.path.exists(CMP_DB_PATH) else None
             ),
+            "query_errors": list(_query_errors),
             "summary_sheet": SUMMARY_SHEET_ID,
             "onchain_sheet": ONCHAIN_SHEET_ID,
             "summary_error": summary_err,
