@@ -11,6 +11,7 @@ import httpx
 from ..config import (
     TRONGRID_BASE_URL,
     TRONGRID_API_KEY,
+    TRON_HTTP_ENDPOINTS,
     USE_GRPC,
     logger,
 )
@@ -21,6 +22,38 @@ _http: Optional[httpx.AsyncClient] = None
 
 def _headers() -> dict:
     return {"TRON-PRO-API-KEY": TRONGRID_API_KEY} if TRONGRID_API_KEY else {}
+
+
+def _http_targets() -> list:
+    """(base_url, headers) per HTTP node, in priority order.
+
+    Falls back to the single TRONGRID_BASE_URL when no node list is configured,
+    which is what every existing deployment does.
+    """
+    if TRON_HTTP_ENDPOINTS:
+        return [(e.host, dict(e.headers)) for e in TRON_HTTP_ENDPOINTS]
+    return [(TRONGRID_BASE_URL, _headers())]
+
+
+async def _http_post(path: str, payload: dict) -> Optional[Dict[str, Any]]:
+    """POST `path` to each HTTP node until one answers 200.
+
+    A self-hosted full node and TronGrid expose the same wallet/* routes, so a
+    single request shape covers both; only the auth header differs per node.
+    """
+    client = await _client()
+    last = None
+    for base, headers in _http_targets():
+        try:
+            resp = await client.post(f"{base}{path}", headers=headers, json=payload)
+            if resp.status_code == 200:
+                return _normalize_http_block(resp.json())
+            last = f"{resp.status_code} from {base}"
+        except Exception as e:  # move to the next node rather than giving up
+            last = f"{type(e).__name__} from {base}: {e}"
+    if last:
+        logger.warning(f"HTTP {path} failed on every node ({last})")
+    return None
 
 
 async def _client() -> httpx.AsyncClient:
@@ -89,37 +122,11 @@ def _normalize_grpc_block(block: dict) -> Optional[Dict[str, Any]]:
 
 
 async def http_get_now_block() -> Optional[Dict[str, Any]]:
-    try:
-        client = await _client()
-        resp = await client.post(
-            f"{TRONGRID_BASE_URL}/wallet/getnowblock",
-            headers=_headers(),
-            json={},
-        )
-        if resp.status_code != 200:
-            logger.warning(f"HTTP getnowblock failed: {resp.status_code}")
-            return None
-        return _normalize_http_block(resp.json())
-    except Exception as e:
-        logger.error(f"HTTP getnowblock error: {e}")
-        return None
+    return await _http_post("/wallet/getnowblock", {})
 
 
 async def http_get_block_by_num(block_num: int) -> Optional[Dict[str, Any]]:
-    try:
-        client = await _client()
-        resp = await client.post(
-            f"{TRONGRID_BASE_URL}/wallet/getblockbynum",
-            headers=_headers(),
-            json={"num": block_num},
-        )
-        if resp.status_code != 200:
-            logger.warning(f"HTTP getblockbynum {block_num} failed: {resp.status_code}")
-            return None
-        return _normalize_http_block(resp.json())
-    except Exception as e:
-        logger.error(f"HTTP getblockbynum error: {e}")
-        return None
+    return await _http_post("/wallet/getblockbynum", {"num": block_num})
 
 
 async def get_now_block() -> Optional[Dict[str, Any]]:

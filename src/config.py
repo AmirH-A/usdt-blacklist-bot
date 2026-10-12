@@ -53,6 +53,13 @@ CHAINSTACK_GRPC_HOST_FALLBACK = os.getenv(
 CHAINSTACK_GRPC_PORT_FALLBACK = int(os.getenv("CHAINSTACK_GRPC_PORT_FALLBACK", "443"))
 CHAINSTACK_API_TOKEN_FALLBACK = os.getenv("CHAINSTACK_API_TOKEN_FALLBACK", "")
 
+# Provider credential watchdog. A dead key is silent (failover hides it), so
+# probe each configured endpoint and alert ADMIN_CHAT_ID when one needs
+# rotating. 300s costs ~288 probe calls/day/endpoint -- noise against the
+# 0.25s block poll.
+PROVIDER_PROBE_INTERVAL = float(os.getenv("PROVIDER_PROBE_INTERVAL", "300"))
+PROVIDER_REMIND_HOURS = float(os.getenv("PROVIDER_REMIND_HOURS", "6"))
+
 
 def _tron_grpc_endpoints() -> list:
     """Ordered (host, port, token); primary first, then any fallback."""
@@ -69,6 +76,14 @@ def _tron_grpc_endpoints() -> list:
 
 
 TRON_GRPC_ENDPOINTS = _tron_grpc_endpoints()
+
+# --- node endpoints as configuration ---------------------------------------
+# TRON_NODES / ETH_NODES take an ordered, comma-separated list of node URLs, so
+# a self-hosted or third-party node needs no code change. src/nodes.py lists
+# the accepted forms. Unset means "use the variables above", which keeps an
+# existing deployment byte-identical.
+TRON_NODES = os.getenv("TRON_NODES", "")
+ETH_NODES = os.getenv("ETH_NODES", "")
 
 ETH_USDT_CONTRACT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
 ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
@@ -95,6 +110,23 @@ def _eth_rpc_urls() -> list:
 
 
 ETH_RPC_URLS = _eth_rpc_urls()
+
+from .nodes import eth_endpoints, tron_endpoints  # noqa: E402
+
+# Resolved endpoint lists, priority-ordered; these are what the clients read.
+TRON_ENDPOINTS = tron_endpoints(
+    TRON_NODES, TRON_GRPC_ENDPOINTS, TRONGRID_BASE_URL, TRONGRID_API_KEY
+)
+ETH_ENDPOINTS = eth_endpoints(ETH_NODES, ETH_RPC_URLS)
+
+# The legacy names now point at the resolved lists, so every existing caller
+# honours TRON_NODES / ETH_NODES without being touched.
+TRON_GRPC_ENDPOINTS = [
+    (e.host, e.port, e.token) for e in TRON_ENDPOINTS if e.kind == "grpc"
+]
+TRON_HTTP_ENDPOINTS = [e for e in TRON_ENDPOINTS if e.kind == "http"]
+ETH_RPC_URLS = [e.host for e in ETH_ENDPOINTS]
+ETH_RPC_HEADERS = {e.host: dict(e.headers) for e in ETH_ENDPOINTS}
 
 # Mempool sources, raced first-seen-wins. Measured on this box: Chainstack sees a
 # pending tx ~449ms before Alchemy (238/250 shared hashes), while Alchemy is the
@@ -156,7 +188,9 @@ BLOCK_MAX_CATCHUP = int(os.getenv("BLOCK_MAX_CATCHUP", "40"))
 MULTISIG_SCAN_INTERVAL = int(os.getenv("MULTISIG_SCAN_INTERVAL", "15"))
 ETH_MULTISIG_SCAN_INTERVAL = int(os.getenv("ETH_MULTISIG_SCAN_INTERVAL", "3"))
 
-DB_PATH = os.getenv("DB_PATH", "blacklist_tracker.db")
+DB_PATH = os.getenv("DB_PATH", "blacklist_tracker.db")  # legacy sqlite, kept for migrate_to_pg.py
+# Postgres (zarin-fd-db on 127.0.0.1:5435). Replaces the sqlite file above.
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("USDTFreezeBot")

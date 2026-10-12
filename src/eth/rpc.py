@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from ..config import ETH_RPC_URL, ETH_RPC_URLS, logger
+from ..config import ETH_RPC_HEADERS, ETH_RPC_URL, ETH_RPC_URLS, logger
 
 _http: Optional[httpx.AsyncClient] = None
 
@@ -67,10 +67,13 @@ async def rpc_call(method: str, params: list) -> Any:
 
     for _ in range(max(1, len(_urls))):
         url = _urls[_url_i]
+        # Per-node auth: a key in the URL path needs no header, a self-hosted or
+        # header-authenticated node does. Empty for both of today's Chainstack
+        # URLs, so those requests are unchanged.
+        headers = {"Content-Type": "application/json"}
+        headers.update(ETH_RPC_HEADERS.get(url) or {})
         try:
-            resp = await client.post(
-                url, json=body, headers={"Content-Type": "application/json"}
-            )
+            resp = await client.post(url, json=body, headers=headers)
         except Exception as e:
             logger.warning(f"ETH RPC {method} transport error: {type(e).__name__}: {e}")
             if _rotate_url():

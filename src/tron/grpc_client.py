@@ -213,9 +213,12 @@ def parse_trigger_smart_contract(data: bytes) -> Dict[str, Any]:
 
 
 def grpc_available() -> bool:
-    # Any configured endpoint will do -- the primary token may be dead while a
-    # fallback still works, which is the whole point of the endpoint list.
-    return bool(grpc) and USE_GRPC and bool(TRON_GRPC_ENDPOINTS or CHAINSTACK_API_TOKEN)
+    # The resolved endpoint list is authoritative: TRON_NODES may deliberately
+    # list only HTTP nodes, and falling back to the raw CHAINSTACK_API_TOKEN
+    # would then dial a gRPC endpoint the operator did not ask for. The list is
+    # built from those same tokens when TRON_NODES is unset, so a legacy
+    # deployment is unaffected.
+    return bool(grpc) and USE_GRPC and bool(TRON_GRPC_ENDPOINTS)
 
 
 class TronGrpcClient:
@@ -234,11 +237,17 @@ class TronGrpcClient:
                 api_token or CHAINSTACK_API_TOKEN,
             )]
         else:
-            self._endpoints = list(TRON_GRPC_ENDPOINTS) or [(
-                CHAINSTACK_GRPC_HOST, CHAINSTACK_GRPC_PORT, CHAINSTACK_API_TOKEN,
-            )]
+            # No synthesised fallback: an empty list means no gRPC endpoint is
+            # configured, and inventing one from the raw CHAINSTACK_* values
+            # would ignore an explicit HTTP-only TRON_NODES.
+            self._endpoints = list(TRON_GRPC_ENDPOINTS)
         self._ep_index = 0
-        self.host, self.port, self.api_token = self._endpoints[0]
+        # An empty list is legitimate now (HTTP-only TRON_NODES). Keep the
+        # attributes defined so callers and logs do not need a special case;
+        # grpc_available() already stops the watchers reaching this client.
+        self.host, self.port, self.api_token = (
+            self._endpoints[0] if self._endpoints else ("", 0, "")
+        )
         self._channel = None
         self._initialized = False
         self.failovers = 0          # surfaced for /health
