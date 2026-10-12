@@ -100,6 +100,9 @@ async def _handle_block_ops(ops: list, chain: str):
                 multisig_tx_id=op.get("multisig_tx_id"),
             )
             if not is_new and op.get("block_timestamp"):
+                # Already recorded -- most likely seen in the mempool before this
+                # block existed. Attach the real block time; detected_at keeps
+                # the earlier sighting so the delay metric shows the true lead.
                 if database.backfill_submission_block(
                     chain, op["tx_hash"], op["block_timestamp"]
                 ):
@@ -258,14 +261,14 @@ async def listen_to_multisig_submissions():
                 tx_hash = event["tx_hash"]
                 block_timestamp = event["block_timestamp"]
 
-                conn = database.get_db()
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT target_address, action FROM multisig_pending WHERE submission_tx_hash = ? AND chain = 'TRON'",
-                    (tx_hash,),
-                )
-                existing = cursor.fetchone()
-                conn.close()
+                with database.get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT target_address, action FROM multisig_pending "
+                        "WHERE submission_tx_hash = %s AND chain = 'TRON'",
+                        (tx_hash,),
+                    )
+                    existing = cursor.fetchone()
 
                 if existing and existing[0]:
                     database.bind_multisig_tx_id("TRON", tx_hash, tx_id)
@@ -398,15 +401,15 @@ async def listen_to_eth_multisig_submissions():
                 block_number = event["block_number"]
                 block_timestamp = event["block_timestamp"]
 
-                conn = database.get_db()
-                cursor = conn.cursor()
-                cursor.execute(
-                    """SELECT tx_id FROM multisig_pending
-                       WHERE chain = 'ETH' AND (tx_id = ? OR submission_tx_hash = ?)""",
-                    (tx_id, tx_hash),
-                )
-                existing = cursor.fetchone()
-                conn.close()
+                with database.get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """SELECT tx_id FROM multisig_pending
+                           WHERE chain = 'ETH'
+                             AND (tx_id = %s OR submission_tx_hash = %s)""",
+                        (tx_id, tx_hash),
+                    )
+                    existing = cursor.fetchone()
 
                 database.bind_multisig_tx_id("ETH", tx_hash, tx_id)
 
