@@ -499,7 +499,8 @@ async def broadcast_confirmed_alerts(items: Sequence[dict[str, Any]]):
     blacklist = [
         item for item in items if (item.get("action") or "blacklist") == "blacklist"
     ]
-    if not blacklist:
+    unblacklist = [item for item in items if item.get("action") == "unblacklist"]
+    if not blacklist and not unblacklist:
         return
 
     subscriber_chats = _with_broadcast({row[0] for row in database.get_subscribers()})
@@ -551,11 +552,27 @@ async def broadcast_confirmed_alerts(items: Sequence[dict[str, Any]]):
             if watchlist:
                 queue_single(item, {row[0] for row in watchlist})
 
+    for item in unblacklist:
+        address = item.get("address") or ""
+        chain = item.get("chain") or "TRON"
+        tx_hash = item.get("tx_hash") or ""
+        when = _pending_time_str(item.get("block_timestamp"))
+        link = _explorer_tx(chain, tx_hash)
+        msg = f"*UNBLACKLIST CONFIRMED* [{chain}]\n\n"
+        msg += f"*Address:*\n`{address}`\n\n"
+        msg += f"*Confirmed:* {when}\n\n"
+        if link:
+            msg += f"[View on Tronscan]({link})"
+        for chat_id in subscriber_chats:
+            tasks.append(_send_pending_one(chat_id, msg, address, chain, False))
+
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     for item in blacklist:
         logger.info(f"CONFIRMED sent: {item.get('address')} ({item.get('chain')})")
+    for item in unblacklist:
+        logger.info(f"UNBLACKLIST CONFIRMED sent: {item.get('address')} ({item.get('chain')})")
 
 
 async def broadcast_early_warning_alert(

@@ -369,10 +369,14 @@ def mark_multisig_executed(
 
         target_address, action, submission_tx_hash, submitted_ts = row[:4]
         cursor.execute(
+            "ALTER TABLE multisig_pending ADD COLUMN IF NOT EXISTS executed_block_timestamp BIGINT"
+        )
+        cursor.execute(
             f"""UPDATE multisig_pending
-               SET executed = 1, executed_at = {_NOW}
+               SET executed = 1, executed_at = {_NOW},
+                   executed_block_timestamp = COALESCE(%s, executed_block_timestamp)
                WHERE tx_id = %s AND chain = %s""",
-            (exec_tx_id, chain),
+            (confirmed_block_timestamp, exec_tx_id, chain),
         )
 
         new_status = "confirmed" if action == "blacklist" else "unfrozen"

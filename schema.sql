@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS multisig_pending (
     submission_block_timestamp BIGINT,
     executed                   SMALLINT DEFAULT 0,
     executed_at                TEXT,
+    executed_block_timestamp   BIGINT,
     alerted                    SMALLINT DEFAULT 0,
     PRIMARY KEY (tx_id, chain)
 );

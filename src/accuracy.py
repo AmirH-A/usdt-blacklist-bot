@@ -359,6 +359,24 @@ def _sys_delay_from_columns(
     return _delay_onchain_to_saved(_parse_dt(onchain_iso), _parse_dt(system_iso))
 
 
+
+def _fill_missing_timing(
+    onchain_iso, delay_s, alert_iso, sys
+):
+    """Fill On-chain and Alert delay when the sheet left them blank.
+
+    Unblacklist pending is stored only on multisig_pending, so the summary
+    sheet row has System saved but no tx hash and no on-chain time. Use the
+    block time of the same DB row that supplied System saved. Never replace
+    an on-chain time the sheet already has.
+    """
+    if not onchain_iso and sys.get("system_onchain_ms") is not None:
+        onchain_iso = _iso_from_ms(sys["system_onchain_ms"])
+    if delay_s is None:
+        delay_s = _sys_delay_from_columns(onchain_iso, alert_iso)
+    return onchain_iso, delay_s
+
+
 def _build_system_detected_index(
     bot: Optional[sqlite3.Connection],
 ) -> tuple[dict[tuple[str, str, str], dict], dict[tuple[str, str, str], dict]]:
@@ -418,6 +436,24 @@ def _build_system_detected_index(
                 "system_onchain_ms": _ts_ms(row["block_timestamp"]),
             }
             put(rec, addr, chain, "pending", row["tx_hash"] or "")
+
+    # Executed unblacklist, hash only. A by-address confirmed entry would
+    # stick one unfrozen row onto every blacklist confirmation of that address.
+    for row in _query(
+        bot,
+        """SELECT chain, submission_tx_hash, executed_at,
+                  COALESCE(executed_block_timestamp, submission_block_timestamp) AS onchain_ms
+           FROM multisig_pending
+           WHERE action = 'unblacklist' AND executed = 1""",
+    ):
+        h = _norm_hash(row["submission_tx_hash"] or "")
+        if not h:
+            continue
+        chain = (row["chain"] or "TRON").upper()
+        by_hash[(h, chain, "confirmed")] = {
+            "system_detected_at": _iso(_parse_dt(row["executed_at"])),
+            "system_onchain_ms": _ts_ms(row["onchain_ms"]),
+        }
 
     return by_key, by_hash
 
@@ -1039,12 +1075,16 @@ def _build_report(
             onchain_from_db = _iso_from_ms(sys["system_onchain_ms"])
             if onchain_from_db:
                 onchain_iso = onchain_from_db
+        onchain_iso, delay_s = _fill_missing_timing(
+            onchain_iso, ev.get("delay_s"), ev.get("alert_time"), sys
+        )
         system_delay_s = _sys_delay_from_columns(onchain_iso, system_detected_at)
         lead_s = _lead_s(onchain_iso, system_detected_at)
         events.append(
             {
                 **ev,
                 "onchain_time": onchain_iso,
+                "delay_s": delay_s,
                 "system_detected_at": system_detected_at,
                 "system_delay_s": system_delay_s,
                 "lead_s": lead_s,
