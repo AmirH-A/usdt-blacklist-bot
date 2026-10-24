@@ -30,6 +30,7 @@ from .listeners import (
     reap_eth_phantom_submissions,
 )
 from .eth.rpc import rpc_enabled
+from .provider_watch import watch_providers
 
 
 def _start_listeners():
@@ -50,6 +51,10 @@ def _start_listeners():
             tasks.append(asyncio.create_task(listen_to_eth_mempool()))
             tasks.append(asyncio.create_task(reap_eth_phantom_submissions()))
             logger.info("ETH mempool pre-block watcher started (+ phantom reaper)")
+
+    # Credential watchdog last: it only probes, and both chains'
+    # endpoints are already resolved by now.
+    tasks.append(asyncio.create_task(watch_providers()))
 
     chains = []
     if ENABLE_TRON:

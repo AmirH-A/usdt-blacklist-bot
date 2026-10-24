@@ -33,6 +33,8 @@ from .config import (
 )
 from . import health
 from .bot import bot
+from .eth.rpc import active_rpc_index
+from .tron.grpc_client import active_endpoint_index
 
 # What a status code means for the person who has to fix it.
 _MEANING = {
@@ -99,6 +101,18 @@ async def _probe_eth(client: httpx.AsyncClient, url: str) -> Optional[int]:
         return 0
 
 
+def _in_use(codes: list, active: int) -> list:
+    """The (index, code) pairs to alert on: only the endpoint detection is
+    using right now. A failed fallback that nothing reads is not news; it
+    shows up in "Working endpoints" when the one in use goes down.
+    # ponytail: a dead fallback stays silent until it is needed. Alert on it
+    # too if a second key dying unnoticed ever bites.
+    """
+    if 0 <= active < len(codes):
+        return [(active, codes[active])]
+    return list(enumerate(codes))
+
+
 def _label(url: str) -> str:
     """Endpoint identity for the alert, without leaking the whole key."""
     tail = url.rstrip("/").split("/")[-1]
@@ -162,12 +176,12 @@ async def watch_providers():
                 )
                 eth_codes = await asyncio.gather(*[_probe_eth(client, u) for u in eth])
 
-                for chain, codes, eps, envs in (
-                    ("TRON", tron_codes, tron, tron_env),
-                    ("ETH", eth_codes, eth, eth_env),
+                for chain, codes, eps, envs, active in (
+                    ("TRON", tron_codes, tron, tron_env, active_endpoint_index()),
+                    ("ETH", eth_codes, eth, eth_env, active_rpc_index()),
                 ):
                     live = sum(1 for c in codes if c is None)
-                    for i, code in enumerate(codes):
+                    for i, code in _in_use(codes, active):
                         key = f"{chain}:{i}"
                         name = (
                             f"{CHAINSTACK_GRPC_HOST} #{i + 1}"

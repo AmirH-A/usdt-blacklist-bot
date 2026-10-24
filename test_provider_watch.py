@@ -1,6 +1,6 @@
 """Transition logic for the provider watchdog. Run: python3 test_provider_watch.py"""
 
-from src.provider_watch import _decide, _down_message, _label, _meaning
+from src.provider_watch import _decide, _down_message, _in_use, _label, _meaning
 
 REMIND = 6 * 3600.0
 
@@ -50,6 +50,15 @@ def test_message_tells_you_to_rotate_only_for_auth_codes():
     blip = _down_message("ETH", "...abc123", 0, "ETH_RPC_URL", 0, 2)
     assert "CHANGE API KEY" not in blip
     assert "Chainstack" not in blip
+
+
+def test_only_the_endpoint_in_use_is_reported():
+    # Fallback (#2) dead, detection on #1: nothing to say about #2.
+    assert _in_use([None, 403], 0) == [(0, None)]
+    # Detection failed over to #2 and #2 is dead too: report #2 only.
+    assert _in_use([403, 403], 1) == [(1, 403)]
+    # Unknown active index: fall back to reporting every endpoint.
+    assert _in_use([403, None], 5) == [(0, 403), (1, None)]
 
 
 def test_label_hides_most_of_the_key():

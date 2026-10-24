@@ -20,6 +20,11 @@ _url_i: int = 0
 rpc_failovers: int = 0
 
 
+def active_rpc_index() -> int:
+    """Index into ETH_RPC_URLS that detection is currently using."""
+    return _url_i
+
+
 def active_rpc_url() -> Optional[str]:
     return _urls[_url_i] if _urls else None
 

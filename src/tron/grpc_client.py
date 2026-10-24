@@ -400,6 +400,11 @@ class TronGrpcClient:
 _grpc_client: Optional[TronGrpcClient] = None
 
 
+def active_endpoint_index() -> int:
+    """Index into TRON_GRPC_ENDPOINTS that detection is currently using."""
+    return _grpc_client._ep_index if _grpc_client else 0
+
+
 def get_grpc_client() -> TronGrpcClient:
     global _grpc_client
     if _grpc_client is None:
