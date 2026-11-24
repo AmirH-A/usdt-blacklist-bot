@@ -42,3 +42,13 @@ Thumbs.db
 # Misc
 *.bak
 *.tmp
+
+# Secrets and local state: never commit. Each env file has a *.example.
+*.env
+!*.env.example
+*.session
+*.db
+google_sheets_creds.json
+session-bak/
+# macOS resource forks copied onto the server
+._*
