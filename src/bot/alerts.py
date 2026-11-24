@@ -84,18 +84,19 @@ async def update_message_with_balance(
     address: str,
     chain: str,
     original_text: str,
+    token: str = "USDT",
 ):
     try:
         if chain == "TRON":
             balance = await get_tron_usdt_balance(address)
         else:
-            balance = await get_eth_usdt_balance(address)
+            balance = await get_eth_usdt_balance(address, token)
 
         if balance is None:
             return
 
         whale_tag = " " if balance >= WHALE_THRESHOLD else ""
-        balance_str = f"{balance:,.2f} USDT{whale_tag}"
+        balance_str = f"{balance:,.2f} {token}{whale_tag}"
         new_text = original_text.replace(
             "*Balance:* Unknown", f"*Balance:* {balance_str}"
         )
@@ -219,6 +220,11 @@ async def broadcast_mempool_alert(
 _TELEGRAM_LIMIT = 3900
 
 
+def _chain_tag(chain: str, token: str) -> str:
+    """'[ETH]' for USDT (unchanged, parsers depend on it); '[ETH · XAUt]' otherwise."""
+    return f"[{chain}]" if token == "USDT" else f"[{chain} · {token}]"
+
+
 def _explorer_tx(chain: str, tx_hash: str) -> str:
     if not tx_hash:
         return ""
@@ -243,6 +249,7 @@ def _pending_message(
     chain: str,
     balance: Optional[float],
     block_timestamp: Optional[int],
+    token: str = "USDT",
 ) -> str:
     time_str = _pending_time_str(block_timestamp)
     explorer_link = _explorer_tx(chain, tx_hash)
@@ -250,14 +257,14 @@ def _pending_message(
     whale_tag = ""
     if balance is not None and balance >= WHALE_THRESHOLD:
         whale_tag = " [WHALE]"
-    balance_str = f"{balance:,.2f} USDT" if balance else "Fetching..."
+    balance_str = f"{balance:,.2f} {token}" if balance else "Fetching..."
 
     if action == "blacklist":
         action_text = "BLACKLIST PENDING"
     else:
         action_text = "UNBLACKLIST PENDING"
 
-    msg = f"*{action_text}* [{chain}]{whale_tag}\n\n"
+    msg = f"*{action_text}* {_chain_tag(chain, token)}{whale_tag}\n\n"
     msg += f"*Address:*\n`{address}`\n\n"
     msg += f"*Balance:* {balance_str}\n"
     msg += f"*MultiSig TX:* {multisig_tx_id}\n"
@@ -307,7 +314,8 @@ def _pending_batch_chunks(items: Sequence[dict[str, Any]]) -> list[str]:
         )
     else:
         label = "PENDING"
-    header = f"*{label} [{chain}] — {len(items)} in one block*\n\n"
+    tag = _chain_tag(chain, items[0].get("token") or "USDT")
+    header = f"*{label} {tag} — {len(items)} in one block*\n\n"
     header += f"*Submitted:* {time_str}\n"
     if block_number:
         header += f"*Block:* `{block_number}`\n"
@@ -336,6 +344,7 @@ def _group_pending_items(
     for item in items:
         key = (
             item.get("chain") or "TRON",
+            item.get("token") or "USDT",
             item.get("block_number") or 0,
             item.get("block_timestamp") or 0,
         )
@@ -354,16 +363,18 @@ def _confirmed_message(
     elapsed_seconds: Optional[float],
     is_update: bool,
     block_timestamp: Optional[int] = None,
+    token: str = "USDT",
 ) -> str:
     time_str = _pending_time_str(block_timestamp)
     explorer_link = _explorer_tx(chain, tx_hash)
     explorer_name = "Etherscan" if chain == "ETH" else "Tronscan"
-    balance_text = format_usdt_balance(balance)
+    balance_text = format_usdt_balance(balance, token)
     whale_tag = " [WHALE]" if balance is not None and balance >= WHALE_THRESHOLD else ""
+    tag = _chain_tag(chain, token)
     title = (
-        f"BLOCK CONFIRMED [{chain}]{whale_tag}"
+        f"BLOCK CONFIRMED {tag}{whale_tag}"
         if is_update
-        else f"ADDRESS BLOCKED [{chain}]{whale_tag}"
+        else f"ADDRESS BLOCKED {tag}{whale_tag}"
     )
     msg = f"*{title}*\n\n"
     msg += f"*Address:*\n`{address}`\n\n"
@@ -371,7 +382,7 @@ def _confirmed_message(
     msg += f"*Confirmed:* {time_str}\n"
     if elapsed_seconds is not None:
             msg += f"*Redemption time:* {format_elapsed_time(elapsed_seconds)}\n"
-    msg += f"\nAddress officially blacklisted. USDT transfers frozen.\n\n"
+    msg += f"\nAddress officially blacklisted. {token} transfers frozen.\n\n"
     msg += f"[View on {explorer_name}]({explorer_link})"
     return msg
 
@@ -380,7 +391,8 @@ def _confirmed_batch_chunks(items: Sequence[dict[str, Any]]) -> list[str]:
     chain = items[0].get("chain") or "TRON"
     time_str = _pending_time_str(items[0].get("block_timestamp"))
     block_number = items[0].get("block_number")
-    header = f"*BLOCK CONFIRMED [{chain}] — {len(items)} in one block*\n\n"
+    tag = _chain_tag(chain, items[0].get("token") or "USDT")
+    header = f"*BLOCK CONFIRMED {tag} — {len(items)} in one block*\n\n"
     header += f"*Confirmed:* {time_str}\n"
     if block_number:
         header += f"*Block:* `{block_number}`\n"
@@ -417,6 +429,7 @@ async def _send_pending_one(
     address: str,
     chain: str,
     patch_balance: bool,
+    token: str = "USDT",
 ):
     try:
         result = await _send_raw(chat_id, msg)
@@ -426,7 +439,7 @@ async def _send_pending_one(
     if patch_balance and result and getattr(result, "message_id", None):
         asyncio.create_task(
             update_message_with_balance(
-                result.chat.id, result.message_id, address, chain, msg
+                result.chat.id, result.message_id, address, chain, msg, token
             )
         )
     return result
@@ -455,10 +468,12 @@ async def broadcast_early_warning_alerts(items: Sequence[dict[str, Any]]):
             chain=chain,
             balance=item.get("balance"),
             block_timestamp=item.get("block_timestamp"),
+            token=item.get("token") or "USDT",
         )
         patch = item.get("balance") is None
+        token = item.get("token") or "USDT"
         for chat_id in chats:
-            tasks.append(_send_pending_one(chat_id, msg, address, chain, patch))
+            tasks.append(_send_pending_one(chat_id, msg, address, chain, patch, token))
 
     for group in _group_pending_items(items):
         chain = group[0].get("chain") or "TRON"
@@ -517,6 +532,7 @@ async def broadcast_confirmed_alerts(items: Sequence[dict[str, Any]]):
             elapsed_seconds=item.get("elapsed_seconds"),
             is_update=item.get("is_update", True),
             block_timestamp=item.get("block_timestamp"),
+            token=item.get("token") or "USDT",
         )
         if chats:
             watchlist = {
@@ -527,7 +543,8 @@ async def broadcast_confirmed_alerts(items: Sequence[dict[str, Any]]):
                 text = "*[WATCHLIST ALERT]*\n\n" + msg if chat_id in overlap else msg
                 tasks.append(
                     _send_pending_one(
-                        chat_id, text, address, chain, item.get("balance") is None
+                        chat_id, text, address, chain, item.get("balance") is None,
+                        item.get("token") or "USDT",
                     )
                 )
 
@@ -558,7 +575,7 @@ async def broadcast_confirmed_alerts(items: Sequence[dict[str, Any]]):
         tx_hash = item.get("tx_hash") or ""
         when = _pending_time_str(item.get("block_timestamp"))
         link = _explorer_tx(chain, tx_hash)
-        msg = f"*UNBLACKLIST CONFIRMED* [{chain}]\n\n"
+        msg = f"*UNBLACKLIST CONFIRMED* {_chain_tag(chain, item.get('token') or 'USDT')}\n\n"
         msg += f"*Address:*\n`{address}`\n\n"
         msg += f"*Confirmed:* {when}\n\n"
         if link:

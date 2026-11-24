@@ -34,7 +34,8 @@ def _db():
         CREATE TABLE multisig_pending (
             tx_id INTEGER, chain TEXT, target_address TEXT, action TEXT,
             submission_tx_hash TEXT, submitted_at TEXT,
-            submission_block_timestamp INTEGER, executed INTEGER DEFAULT 0
+            submission_block_timestamp INTEGER, executed INTEGER DEFAULT 0,
+            token TEXT NOT NULL DEFAULT 'USDT'
         );
         CREATE TABLE blacklist (
             address TEXT, chain TEXT, status TEXT, tx_hash TEXT,
@@ -55,7 +56,9 @@ def _db():
         (11114, "TRON", ADDR, "unblacklist", "0xsep1254", "2026-09-25 12:54:15", sep25_1254, 1),
     ]
     conn.executemany(
-        "INSERT INTO multisig_pending VALUES (?,?,?,?,?,?,?,?)", rows
+        "INSERT INTO multisig_pending (tx_id, chain, target_address, action, "
+        "submission_tx_hash, submitted_at, submission_block_timestamp, executed) "
+        "VALUES (?,?,?,?,?,?,?,?)", rows
     )
     # prod carries this as 'unfrozen', which the old index dropped entirely
     conn.execute(

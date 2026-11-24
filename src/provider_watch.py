@@ -24,11 +24,12 @@ import httpx
 
 from .config import (
     ADMIN_CHAT_ID,
-    CHAINSTACK_GRPC_HOST,
+    ETH_NODES,
     ETH_RPC_URLS,
     PROVIDER_PROBE_INTERVAL,
     PROVIDER_REMIND_HOURS,
     TRON_GRPC_ENDPOINTS,
+    TRON_NODES,
     logger,
 )
 from . import health
@@ -113,6 +114,28 @@ def _in_use(codes: list, active: int) -> list:
     return list(enumerate(codes))
 
 
+def _env_names(list_var: str, raw: str, n: int, legacy: list) -> dict:
+    """Where each endpoint is configured, for the "set X" line of an alert."""
+    if raw.strip():
+        return {i: f"{list_var} entry #{i + 1}" for i in range(n)}
+    return dict(enumerate(legacy))
+
+
+def _pool_low(live: int, total: int) -> bool:
+    """One working endpoint or none, out of a pool that has spares."""
+    return total > 1 and live <= 1
+
+
+def _pool_message(chain: str, live: int, total: int) -> str:
+    var = "TRON_NODES" if chain == "TRON" else "ETH_NODES"
+    return (
+        f"*FD -- KEY POOL LOW [{chain}]*\n\n"
+        f"Working endpoints: {live}/{total}\n"
+        f"Add or renew keys in `{var}` in `/root/zarin-freeze-detector/.env`\n"
+        "and `systemctl restart zarin-bot`"
+    )
+
+
 def _label(url: str) -> str:
     """Endpoint identity for the alert, without leaking the whole key."""
     tail = url.rstrip("/").split("/")[-1]
@@ -160,8 +183,10 @@ async def watch_providers():
         return
 
     remind_s = PROVIDER_REMIND_HOURS * 3600.0
-    tron_env = {0: "CHAINSTACK_API_TOKEN", 1: "CHAINSTACK_API_TOKEN_FALLBACK"}
-    eth_env = {0: "ETH_RPC_URL", 1: "ETH_RPC_URL_FALLBACK"}
+    tron_env = _env_names("TRON_NODES", TRON_NODES, len(tron),
+                          ["CHAINSTACK_API_TOKEN", "CHAINSTACK_API_TOKEN_FALLBACK"])
+    eth_env = _env_names("ETH_NODES", ETH_NODES, len(eth),
+                         ["ETH_RPC_URL", "ETH_RPC_URL_FALLBACK"])
     state: dict = {}
     logger.info(
         f"provider watchdog started (every {PROVIDER_PROBE_INTERVAL}s, "
@@ -184,7 +209,7 @@ async def watch_providers():
                     for i, code in _in_use(codes, active):
                         key = f"{chain}:{i}"
                         name = (
-                            f"{CHAINSTACK_GRPC_HOST} #{i + 1}"
+                            f"{eps[i][0]} #{i + 1}"
                             if chain == "TRON"
                             else _label(eps[i])
                         )
@@ -210,6 +235,14 @@ async def watch_providers():
                                 f"`{name}` is answering again "
                                 f"({live}/{len(codes)} working)."
                             )
+                    # The pool alarm: failover hides each dead key, so say so
+                    # while one working key is left, not after the last one.
+                    action, state[f"{chain}:pool"] = _decide(
+                        state.get(f"{chain}:pool", {}),
+                        not _pool_low(live, len(codes)), time.time(), remind_s,
+                    )
+                    if action in ("down", "remind"):
+                        await _notify(_pool_message(chain, live, len(codes)))
             except asyncio.CancelledError:
                 raise
             except Exception as e:

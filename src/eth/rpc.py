@@ -43,6 +43,18 @@ def _rotate_url() -> bool:
     return True
 
 
+_LIMIT_CODES = {429, -32001, -32005, -32090}
+_LIMIT_WORDS = ("limit", "quota", "rate", "capacity", "exceeded")
+
+
+def _is_limit_error(err) -> bool:
+    """A JSON-RPC error that means this key is throttled or out of quota."""
+    if not isinstance(err, dict):
+        return False
+    msg = str(err.get("message", "")).lower()
+    return err.get("code") in _LIMIT_CODES or any(w in msg for w in _LIMIT_WORDS)
+
+
 async def _client() -> httpx.AsyncClient:
     global _http
     if _http is None or _http.is_closed:
@@ -92,8 +104,13 @@ async def rpc_call(method: str, params: list) -> Any:
             return None
 
         payload = resp.json()
-        if payload.get("error"):
-            logger.warning(f"ETH RPC {method} error: {payload['error']}")
+        err = payload.get("error")
+        if err:
+            logger.warning(f"ETH RPC {method} error: {err}")
+            # Some providers report an exhausted key inside an HTTP 200 (1rpc:
+            # -32001 "usage limit"); that is the key, not the request, so move on.
+            if _is_limit_error(err) and _rotate_url():
+                continue
             return None
         return payload.get("result")
 

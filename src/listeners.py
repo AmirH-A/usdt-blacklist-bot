@@ -58,6 +58,7 @@ def _pending_item(op: dict, chain: str) -> dict:
         "chain": chain,
         "multisig_tx_id": op.get("multisig_tx_id") or 0,
         "balance": None,
+        "token": op.get("token") or "USDT",
     }
 
 
@@ -79,6 +80,7 @@ def _confirmed_item(marked: dict, exec_event: dict, chain: str) -> dict:
         "elapsed_seconds": elapsed,
         "is_update": True,
         "balance": None,
+        "token": marked.get("token") or "USDT",
         "multisig_tx_id": exec_event.get("multisig_tx_id")
         or exec_event.get("transaction_id")
         or 0,
@@ -98,6 +100,7 @@ async def _handle_block_ops(ops: list, chain: str):
                 action=op["action"],
                 block_timestamp=op["block_timestamp"],
                 multisig_tx_id=op.get("multisig_tx_id"),
+                token=op.get("token") or "USDT",
             )
             if not is_new and op.get("block_timestamp"):
                 # Already recorded -- most likely seen in the mempool before this
@@ -394,6 +397,7 @@ async def listen_to_eth_multisig_submissions():
 
             alerts = []
             processed_blocks = []
+            retry_block = None
 
             for event in events:
                 tx_id = event["transaction_id"]
@@ -417,13 +421,20 @@ async def listen_to_eth_multisig_submissions():
                     processed_blocks.append(block_number)
                     continue
 
-                target_info = await get_eth_multisig_tx_target(tx_hash)
+                try:
+                    target_info = await get_eth_multisig_tx_target(tx_hash)
+                except Exception as e:
+                    # Rescan from this block next cycle; rows already stored dedupe by hash.
+                    logger.warning(f"ETH MultiSig: TX #{tx_id} lookup failed, retrying: {e}")
+                    retry_block = block_number
+                    break
                 if not target_info:
                     processed_blocks.append(block_number)
                     continue
 
                 target_address = target_info["target_address"]
                 action = target_info["action"]
+                token = target_info["token"]
                 is_new = database.record_multisig_submission(
                     chain="ETH",
                     tx_hash=tx_hash,
@@ -431,13 +442,14 @@ async def listen_to_eth_multisig_submissions():
                     action=action,
                     block_timestamp=block_timestamp,
                     multisig_tx_id=tx_id,
+                    token=token,
                 )
                 logger.info(
                     f"ETH HTTP FALLBACK: {action} -> {target_address} (TX #{tx_id})"
                 )
                 if is_new:
                     alerts.append(
-                        (target_address, action, tx_hash, block_timestamp, tx_id)
+                        (target_address, action, tx_hash, block_timestamp, tx_id, token)
                     )
                 processed_blocks.append(block_number)
 
@@ -452,18 +464,21 @@ async def listen_to_eth_multisig_submissions():
                             "chain": "ETH",
                             "multisig_tx_id": tx_id,
                             "balance": None,
+                            "token": token,
                         }
-                        for addr, action, tx_hash, ts, tx_id in alerts[
+                        for addr, action, tx_hash, ts, tx_id, token in alerts[
                             :MAX_ALERTS_PER_CYCLE
                         ]
                     ]
                 )
 
-            if processed_blocks:
-                new_block = max(processed_blocks) + 1
-                if new_block > last_block:
-                    last_block = new_block
-                    database.set_sync_state("eth_multisig_last_block", str(last_block))
+            if retry_block is not None:
+                new_block = retry_block
+            else:
+                new_block = max(processed_blocks, default=last_block - 1) + 1
+            if new_block > last_block:
+                last_block = new_block
+                database.set_sync_state("eth_multisig_last_block", str(last_block))
 
             exec_from = last_block - 1000 if last_block > 1000 else 0
             exec_events = await get_eth_multisig_execution_events(from_block=exec_from)

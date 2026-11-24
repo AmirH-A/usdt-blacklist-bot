@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS multisig_pending (
     PRIMARY KEY (tx_id, chain)
 );
 
+-- Which token the MultiSig proposal freezes. The ETH MultiSig also owns XAUt.
+-- XAUt rows live only here: blacklist is keyed (address, chain), so an XAUt
+-- unblock would otherwise flip a USDT-frozen address to 'unfrozen'.
+ALTER TABLE multisig_pending ADD COLUMN IF NOT EXISTS token TEXT NOT NULL DEFAULT 'USDT';
+
 -- record_multisig_submission dedupes on the submission hash, and
 -- bind_multisig_tx_id rewrites tx_id in place; this partial unique index is
 -- what makes both safe under concurrent writers.

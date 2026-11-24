@@ -8,6 +8,7 @@ from ..config import (
     ETH_CHAIN_ID,
     ETH_MULTISIG_WALLET,
     ETH_USDT_CONTRACT,
+    ETH_XAUT_CONTRACT,
     ETH_SUBMISSION_TOPIC,
     ETH_EXECUTION_TOPIC,
     SUBMIT_TRANSACTION_SELECTOR,
@@ -15,8 +16,23 @@ from ..config import (
     CONFIRM_TRANSACTION_SELECTOR,
     ADDBLACKLIST_SELECTOR,
     REMOVEBLACKLIST_SELECTOR,
+    ADDTOBLOCKEDLIST_SELECTOR,
+    REMOVEFROMBLOCKEDLIST_SELECTOR,
     logger,
 )
+from .rpc import rpc_call
+
+# MultiSig destination -> (token, {inner selector: action}).
+_FREEZE_CALLS = {
+    ETH_USDT_CONTRACT.lower(): ("USDT", {
+        ADDBLACKLIST_SELECTOR: "blacklist",
+        REMOVEBLACKLIST_SELECTOR: "unblacklist",
+    }),
+    ETH_XAUT_CONTRACT.lower(): ("XAUt", {
+        ADDTOBLOCKEDLIST_SELECTOR: "blacklist",
+        REMOVEFROMBLOCKEDLIST_SELECTOR: "unblacklist",
+    }),
+}
 
 
 def _hex_body(data: str) -> str:
@@ -33,8 +49,9 @@ def decode_eth_submit_input(input_data: str) -> Optional[dict]:
         return None
     try:
         destination = "0x" + data[32:72]
-        if destination != ETH_USDT_CONTRACT.lower():
+        if destination not in _FREEZE_CALLS:
             return None
+        token, actions = _FREEZE_CALLS[destination]
         data_offset = int(data[136:200], 16)
         length_pos = 8 + data_offset * 2
         if len(data) < length_pos + 64:
@@ -44,15 +61,11 @@ def decode_eth_submit_input(input_data: str) -> Optional[dict]:
         inner_data = data[data_start : data_start + data_length * 2]
         if len(inner_data) < 72:
             return None
-        inner_selector = inner_data[:8]
-        if inner_selector == ADDBLACKLIST_SELECTOR:
-            action = "blacklist"
-        elif inner_selector == REMOVEBLACKLIST_SELECTOR:
-            action = "unblacklist"
-        else:
+        action = actions.get(inner_data[:8])
+        if not action:
             return None
         target = "0x" + inner_data[32:72]
-        return {"target_address": target, "action": action}
+        return {"target_address": target, "action": action, "token": token}
     except (ValueError, IndexError):
         return None
 
@@ -175,24 +188,24 @@ async def get_eth_multisig_execution_events(
 
 
 async def get_eth_multisig_tx_target(tx_hash: str) -> Optional[dict]:
-    params = {
-        **_get_base_params(),
-        "module": "proxy",
-        "action": "eth_getTransactionByHash",
-        "txhash": tx_hash,
-    }
+    """Decode the submitTransaction behind tx_hash.
 
-    try:
+    None means the tx is not a tracked action (destroyBlackFunds, mint, ...).
+    A failed lookup raises instead: returning None for a rate-limit reply (its
+    `result` is an error string) let the fallback skip real addBlackList
+    submissions for good, e.g. Multisig #5824 and #5827 on 2026-11-06.
+    """
+    tx = await rpc_call("eth_getTransactionByHash", [tx_hash])
+    if not isinstance(tx, dict):
+        params = {
+            **_get_base_params(),
+            "module": "proxy",
+            "action": "eth_getTransactionByHash",
+            "txhash": tx_hash,
+        }
         async with httpx.AsyncClient() as client:
             resp = await client.get(ETHERSCAN_BASE_URL, params=params, timeout=15)
-            data = resp.json()
-            result = data.get("result", {})
-            if not result:
-                return None
-
-            return decode_eth_submit_input(result.get("input", ""))
-
-    except Exception as e:
-        logger.error(f"Error getting ETH MultiSig tx target: {e}")
-
-    return None
+            tx = resp.json().get("result")
+    if not isinstance(tx, dict) or not tx.get("input"):
+        raise LookupError(f"ETH tx {tx_hash} lookup failed: {str(tx)[:120]}")
+    return decode_eth_submit_input(tx["input"])

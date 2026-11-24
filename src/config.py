@@ -86,6 +86,9 @@ TRON_NODES = os.getenv("TRON_NODES", "")
 ETH_NODES = os.getenv("ETH_NODES", "")
 
 ETH_USDT_CONTRACT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+# Tether Gold. Owned by the same ETH MultiSig as USDT, but its freeze functions
+# are the newer TetherToken ones: addToBlockedList / removeFromBlockedList.
+ETH_XAUT_CONTRACT = "0x68749665ff8d2d112fa859aa293f07a622782f38"
 ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
 ETH_CHAIN_ID = 1
 ETH_RPC_URL = os.getenv("ETH_RPC_URL", "").rstrip("/")
@@ -173,6 +176,8 @@ ETH_EXECUTION_TOPIC = (
 
 ADDBLACKLIST_SELECTOR = "0ecb93c0"
 REMOVEBLACKLIST_SELECTOR = "e4997dc5"
+ADDTOBLOCKEDLIST_SELECTOR = "3c7c9b90"
+REMOVEFROMBLOCKEDLIST_SELECTOR = "1a14f449"
 SUBMIT_TRANSACTION_SELECTOR = "c6427474"
 EXECUTE_TRANSACTION_SELECTOR = "ee22610b"
 CONFIRM_TRANSACTION_SELECTOR = "c01a8c84"
@@ -193,4 +198,6 @@ DB_PATH = os.getenv("DB_PATH", "blacklist_tracker.db")  # legacy sqlite, kept fo
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 logging.basicConfig(level=logging.INFO)
+# httpx logs every request URL at INFO, API keys included.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("USDTFreezeBot")

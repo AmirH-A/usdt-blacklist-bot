@@ -4,6 +4,7 @@ import httpx
 
 from ..config import (
     ETH_USDT_CONTRACT,
+    ETH_XAUT_CONTRACT,
     ETHERSCAN_BASE_URL,
     ETHERSCAN_API_KEY,
     ETH_CHAIN_ID,
@@ -91,7 +92,11 @@ async def check_eth_address_blacklisted(address: str) -> bool:
     return False
 
 
-async def get_eth_usdt_balance(address: str) -> Optional[float]:
+# Both tokens use 6 decimals.
+_TOKEN_CONTRACTS = {"USDT": ETH_USDT_CONTRACT, "XAUt": ETH_XAUT_CONTRACT}
+
+
+async def get_eth_usdt_balance(address: str, token: str = "USDT") -> Optional[float]:
     if not is_valid_eth_address(address):
         return None
 
@@ -102,7 +107,7 @@ async def get_eth_usdt_balance(address: str) -> Optional[float]:
         **_get_base_params(),
         "module": "proxy",
         "action": "eth_call",
-        "to": ETH_USDT_CONTRACT,
+        "to": _TOKEN_CONTRACTS[token],
         "data": call_data,
         "tag": "latest",
     }

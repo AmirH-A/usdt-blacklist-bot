@@ -63,6 +63,7 @@ def extract_mempool_ops(tx: Dict[str, Any]) -> List[Dict[str, Any]]:
             "tx_hash": tx_hash,
             "action": submitted["action"],
             "target_address": submitted["target_address"],
+            "token": submitted["token"],
             # No block yet. The block watcher backfills both on arrival.
             "block_number": None,
             "block_timestamp": None,

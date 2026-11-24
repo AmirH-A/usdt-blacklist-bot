@@ -29,6 +29,11 @@ def _is_multisig_call(tx: Dict[str, Any]) -> bool:
 
 
 def extract_multisig_ops(block: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Decode Multisig ops from block txs only — no TronGrid event/tx-info calls.
+
+    confirmTransaction is treated like executeTransaction: both carry the Multisig
+    tx id in calldata and are used as the on-chain finalize path.
+    """
     ops = []
     block_number = block.get("block_number") or 0
     block_timestamp = block.get("timestamp") or 0
@@ -56,6 +61,8 @@ def extract_multisig_ops(block: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
             continue
 
+        # Finalizes are almost always confirmTransaction on this Multisig;
+        # executeTransaction is rarer but same calldata shape (uint256 txId).
         exec_id = decode_execute_transaction_data(data)
         if exec_id is None:
             exec_id = decode_confirm_transaction_data(data)

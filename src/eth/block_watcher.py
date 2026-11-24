@@ -44,28 +44,30 @@ def extract_eth_multisig_ops(block: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "tx_hash": tx_hash,
                     "action": submitted["action"],
                     "target_address": submitted["target_address"],
+                    "token": submitted["token"],
                     "block_number": block_number,
                     "block_timestamp": block_timestamp,
                 }
             )
             continue
 
-        # Finalizes are usually confirmTransaction; executeTransaction is rarer.
-        exec_id = decode_eth_execute_input(data)
-        if exec_id is None:
-            exec_id = decode_eth_confirm_input(data)
-        if exec_id is not None:
-            ops.append(
-                {
-                    "kind": "execution",
-                    "tx_hash": tx_hash,
-                    "multisig_tx_id": exec_id,
-                    "block_number": block_number,
-                    "block_timestamp": block_timestamp,
-                }
-            )
+        # No execution from calldata: Tether's ETH Multisig needs 3 confirmations,
+        # so a confirmTransaction is usually not the final one (the 2nd owner's
+        # confirm was being recorded as the freeze executing, 24s-3m early), and
+        # an executeTransaction can still fail. Only an Execution log proves it;
+        # ops_from_eth_block reads those for any block with a finalize call.
 
     return ops
+
+
+def _is_finalize_call(tx: Dict[str, Any]) -> bool:
+    if (tx.get("to") or "") != MULTISIG:
+        return False
+    data = tx.get("data") or ""
+    return (
+        decode_eth_confirm_input(data) is not None
+        or decode_eth_execute_input(data) is not None
+    )
 
 
 def _block_has_kind(ops: List[Dict[str, Any]], kind: str) -> bool:
@@ -121,12 +123,12 @@ async def ops_from_eth_block(block: Dict[str, Any]) -> List[Dict[str, Any]]:
     Fetching Submission logs for this block binds the real id before we record pending.
     """
     ops = extract_eth_multisig_ops(block)
-    if not ops:
+    has_finalize = any(_is_finalize_call(tx) for tx in block.get("transactions") or [])
+    if not ops and not has_finalize:
         return ops
 
     block_num = block["block_number"]
     has_submission = _block_has_kind(ops, "submission")
-    has_execution = _block_has_kind(ops, "execution")
 
     if has_submission:
         sub_logs = await get_eth_logs(
@@ -142,28 +144,15 @@ async def ops_from_eth_block(block: Dict[str, Any]) -> List[Dict[str, Any]]:
             if real_id is not None:
                 op["multisig_tx_id"] = real_id
 
-    # Also pull Execution logs when this block finalized anything (confirm/execute),
-    # in case calldata decode missed a path.
-    if has_execution or any(
-        decode_eth_confirm_input(tx.get("data") or "") is not None
-        for tx in (block.get("transactions") or [])
-        if (tx.get("to") or "") == MULTISIG
-    ):
+    # Executions come only from this block's Execution logs. If the log fetch
+    # fails, the Etherscan Execution poll in listeners marks it a few seconds later.
+    if has_finalize:
         exec_logs = await get_eth_logs(
             ETH_MULTISIG_WALLET,
             ETH_EXECUTION_TOPIC,
             block_num,
         )
-        seen = {
-            (op.get("multisig_tx_id"), (op.get("tx_hash") or "").lower())
-            for op in ops
-            if op.get("kind") == "execution"
-        }
-        for op in _executions_from_logs(exec_logs, block):
-            key = (op.get("multisig_tx_id"), (op.get("tx_hash") or "").lower())
-            if key not in seen:
-                ops.append(op)
-                seen.add(key)
+        ops.extend(_executions_from_logs(exec_logs, block))
 
     # Submissions first, then executions — so same-block confirms can match.
     ops.sort(key=lambda o: 0 if o.get("kind") == "submission" else 1)

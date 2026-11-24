@@ -1,0 +1,19 @@
+[Unit]
+Description=Freeze Detector Accuracy API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/zarin-freeze-detector
+ExecStart=/usr/bin/python3 /root/zarin-freeze-detector/stats_server.py
+Environment=STATS_HOST=127.0.0.1
+Environment=STATS_PORT=8010
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=BOT_DB_PATH=/root/zarin-freeze-detector/blacklist_tracker.db
+Environment=CMP_DB_PATH=/root/zarin-freeze-detector/comparison_tracker.db
+
+[Install]
+WantedBy=multi-user.target

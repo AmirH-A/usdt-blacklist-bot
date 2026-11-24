@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 import urllib.request
 from collections import Counter, defaultdict
@@ -37,7 +38,8 @@ ONCHAIN_SHEET_ID = os.getenv(
 ONCHAIN_GID = os.getenv("ONCHAIN_GID", "1543539254")
 BOT_DB_PATH = os.getenv("BOT_DB_PATH", "blacklist_tracker.db")  # legacy, snapshot only
 # The live bot tables moved to postgres; comparison_tracker.db is still sqlite.
-BOT_DSN = os.getenv("DATABASE_URL", "")
+# The panel reads with its own read-only role (PANEL_DATABASE_URL).
+BOT_DSN = os.getenv("PANEL_DATABASE_URL") or os.getenv("DATABASE_URL", "")
 CMP_DB_PATH = os.getenv("CMP_DB_PATH", "comparison_tracker.db")
 SHEET_CACHE_TTL = int(os.getenv("SHEET_CACHE_TTL", "45"))
 REPORT_CACHE_TTL = int(os.getenv("REPORT_CACHE_TTL", "20"))
@@ -403,7 +405,7 @@ def _build_system_detected_index(
         """SELECT target_address, chain, submission_block_timestamp, submitted_at,
                   submission_tx_hash
            FROM multisig_pending
-           WHERE submission_block_timestamp IS NOT NULL""",
+           WHERE submission_block_timestamp IS NOT NULL AND token = 'USDT'""",
     ):
         chain = (row["chain"] or "TRON").upper()
         detected_at = row["submitted_at"]
@@ -444,7 +446,7 @@ def _build_system_detected_index(
         """SELECT chain, submission_tx_hash, executed_at,
                   COALESCE(executed_block_timestamp, submission_block_timestamp) AS onchain_ms
            FROM multisig_pending
-           WHERE action = 'unblacklist' AND executed = 1""",
+           WHERE action = 'unblacklist' AND executed = 1 AND token = 'USDT'""",
     ):
         h = _norm_hash(row["submission_tx_hash"] or "")
         if not h:
@@ -575,8 +577,9 @@ def _fetch_balance_sync(chain: str, address: str) -> Optional[float]:
         if chain == "ETH"
         else _fetch_tron_balance_sync(addr)
     )
-    if bal is not None:
-        _balance_cache[cache_key] = (now, bal)
+    # A failed lookup (usually a TronGrid 429) is cached as None too, so the
+    # next rebuild does not retry it and add to the rate limiting.
+    _balance_cache[cache_key] = (now, bal)
     return bal
 
 
@@ -661,6 +664,101 @@ def _load_summary() -> tuple[list[dict], Optional[str]]:
     return events, None
 
 
+def _load_alert_history(bot) -> list[dict]:
+    """The alert history imported from the Freeze Summary sheet (alert_history)."""
+    out = []
+    for row in _query(
+        bot,
+        """SELECT chain, address, status,
+                  to_char(onchain_time, 'YYYY-MM-DD HH24:MI:SS') AS onchain_time,
+                  to_char(alert_time, 'YYYY-MM-DD HH24:MI:SS') AS alert_time,
+                  delay_s, tx_hash, balance
+           FROM alert_history ORDER BY alert_time""",
+    ):
+        out.append({
+            "address": row["address"], "chain": row["chain"], "status": row["status"],
+            "onchain_time": row["onchain_time"], "alert_time": row["alert_time"],
+            "delay_s": row["delay_s"], "tx_hash": row["tx_hash"] or "", "balance": row["balance"] or "",
+        })
+    return out
+
+
+def _load_bot_events(bot, after: Optional[str]) -> list[dict]:
+    """Detections from the live bot's own DB, in the sheet's row shape.
+
+    The Freeze Summary sheet was filled by the comparison bot, which is gone;
+    since its last row the bot DB is the source. One freeze gives a PENDING row
+    (MultiSig submission caught) and a CONFIRMED row; a direct blacklist with no
+    MultiSig step (submission block == confirmation block) gives CONFIRMED only.
+    Only rows detected after `after` (the sheet's newest alert) are returned, so
+    the sheet's history is never duplicated.
+    """
+    sub_hash: dict[tuple[str, str], str] = {}
+    for row in _query(
+        bot,
+        """SELECT target_address, chain, submission_tx_hash FROM multisig_pending
+           WHERE token = 'USDT' ORDER BY submitted_at""",
+    ):
+        sub_hash[((row["chain"] or "TRON").upper(), _norm_addr(row["target_address"] or ""))] = (
+            row["submission_tx_hash"] or ""
+        )
+
+    def delay(alert: Optional[str], onchain: Optional[str]) -> Optional[float]:
+        a, o = _parse_dt(alert), _parse_dt(onchain)
+        return round((a - o).total_seconds(), 3) if a and o else None
+
+    out: list[dict] = []
+    for row in _query(
+        bot,
+        """SELECT address, chain, status, detected_at, block_timestamp,
+                  confirmed_at, confirmed_block_timestamp, tx_hash
+           FROM blacklist WHERE status IN ('multisig_pending', 'confirmed')""",
+    ):
+        chain = (row["chain"] or "TRON").upper()
+        addr = _norm_addr(row["address"] or "")
+        detected = _iso(_parse_dt(row["detected_at"]))
+        if not addr or not detected or (after and detected <= after):
+            continue
+        sub_ms, conf_ms = row["block_timestamp"], row["confirmed_block_timestamp"]
+        direct = sub_ms is not None and conf_ms is not None and _ts_ms(sub_ms) == _ts_ms(conf_ms)
+        base = {"address": addr, "chain": chain, "balance": "", "source": "bot_db"}
+        if not direct:
+            onchain = _iso_from_ms(sub_ms)
+            out.append({**base, "status": "pending", "onchain_time": onchain, "alert_time": detected,
+                        "delay_s": delay(detected, onchain),
+                        "tx_hash": sub_hash.get((chain, addr), "")})
+        if row["status"] == "confirmed":
+            onchain = _iso_from_ms(conf_ms)
+            alert = _iso(_parse_dt(row["confirmed_at"])) or detected
+            out.append({**base, "status": "confirmed", "onchain_time": onchain, "alert_time": alert,
+                        "delay_s": delay(alert, onchain), "tx_hash": row["tx_hash"] or ""})
+    return out
+
+
+def _load_onchain_db(bot) -> list[dict]:
+    """Issuer MultiSig events from the FD database (multisig_events)."""
+    out = []
+    for row in _query(
+        bot,
+        """SELECT to_char(logged_at, 'YYYY-MM-DD HH24:MI:SS') AS ts, chain, event_type, tx_id,
+                  target_address, action, tx_hash, coalesce(block::text, '') AS block, status
+           FROM multisig_events ORDER BY logged_at""",
+    ):
+        tx_hash = row["tx_hash"] or ""
+        out.append({
+            "timestamp": row["ts"],
+            "chain": (row["chain"] or "TRON").upper(),
+            "event_type": row["event_type"],
+            "tx_id": row["tx_id"] or "",
+            "address": _norm_addr(row["target_address"] or ""),
+            "action": row["action"] or "",
+            "tx_hash": "" if tx_hash.startswith("sheet:") else tx_hash,
+            "block": row["block"],
+            "status": _norm_status(row["status"] or ""),
+        })
+    return out
+
+
 def _load_onchain() -> tuple[list[dict], Optional[str]]:
     try:
         rows = _fetch_csv(_sheet_url(ONCHAIN_SHEET_ID, ONCHAIN_GID))
@@ -699,7 +797,7 @@ def _latency_stats(delays: list[float]) -> dict:
         (300, "≤5m"),
     ]
     counts = []
-    prev = 0.0
+    prev = float("-inf")
     for le, label in buckets_def:
         n = sum(1 for d in delays if prev < d <= le)
         counts.append({"le": le, "label": label, "n": n})
@@ -728,19 +826,42 @@ def _stale_seconds(iso_value: Optional[str]) -> Optional[float]:
     return round((_now() - dt).total_seconds(), 1)
 
 
+_rebuild_lock = threading.Lock()
+
+
 def build_report(force: bool = False) -> dict[str, Any]:
+    """Returns the last report at once; a stale one is rebuilt in the background.
+
+    A rebuild takes seconds (sheets, on-chain balances), so panel requests are
+    served the previous report while one thread refreshes it. Only the first
+    request after a restart, or a forced one, waits for a build.
+    """
+    cached = _report_cache
+    if force or cached is None:
+        with _rebuild_lock:
+            if force or _report_cache is None:
+                _rebuild()
+        return _report_cache[1]
+    if time.time() - cached[0] >= REPORT_CACHE_TTL and _rebuild_lock.acquire(blocking=False):
+        def run() -> None:
+            try:
+                _rebuild()
+            except Exception:
+                logger.exception("accuracy report rebuild failed")
+            finally:
+                _rebuild_lock.release()
+        threading.Thread(target=run, daemon=True).start()
+    return cached[1]
+
+
+def _rebuild() -> None:
     global _report_cache
     del _query_errors[:]          # per-report; stale errors must not linger
     now = time.time()
-    if not force and _report_cache and now - _report_cache[0] < REPORT_CACHE_TTL:
-        return _report_cache[1]
-
     bot = _open_bot_db()
     cmp = _open_db(CMP_DB_PATH)
     try:
-        report = _build_report(bot, cmp)
-        _report_cache = (now, report)
-        return report
+        _report_cache = (now, _build_report(bot, cmp))
     finally:
         if bot:
             bot.close()
@@ -751,11 +872,25 @@ def build_report(force: bool = False) -> dict[str, Any]:
 def _build_report(
     bot: Optional[sqlite3.Connection], cmp: Optional[sqlite3.Connection]
 ) -> dict:
+    # Alert history lives in the FD database (alert_history, imported once from
+    # the Freeze Summary sheet); the sheet is read only if that table is empty.
+    summary, summary_err = _load_alert_history(bot), None
+    summary_source = "db:alert_history"
+    onchain, onchain_err = _load_onchain_db(bot), None
+    onchain_source = "db:multisig_events"
     with ThreadPoolExecutor(max_workers=2) as pool:
-        summary_f = pool.submit(_load_summary)
-        onchain_f = pool.submit(_load_onchain)
-        summary, summary_err = summary_f.result()
-        onchain, onchain_err = onchain_f.result()
+        summary_f = None if summary else pool.submit(_load_summary)
+        onchain_f = None if onchain else pool.submit(_load_onchain)
+        if summary_f:
+            summary, summary_err = summary_f.result()
+            summary_source = "sheet (alert_history empty)"
+        if onchain_f:
+            onchain, onchain_err = onchain_f.result()
+            onchain_source = "sheet (multisig_events empty)"
+    # Since the sheet's newest row, detections come from the bot DB.
+    summary = summary + _load_bot_events(
+        bot, max((e.get("alert_time") or "" for e in summary), default="") or None
+    )
 
     sync = {
         row["key"]: row["value"]
@@ -794,6 +929,8 @@ def _build_report(
 
     # Same clock as Telegram: MultiSig submit block time → execution block time.
     # One row per executed blacklist proposal, not every historical blacklist row.
+    # The proposal's own executed_block_timestamp comes first: the blacklist row
+    # is per address, so a re-frozen address carries only its latest freeze.
     blacklist_confirm = {
         ((row["address"] or ""), (row["chain"] or "TRON").upper()): row
         for row in _query(
@@ -805,7 +942,8 @@ def _build_report(
     redemptions: list[dict] = []
     for row in _query(
         bot,
-        """SELECT chain, target_address, submission_block_timestamp, executed_at
+        """SELECT chain, target_address, submission_block_timestamp, executed_at,
+                  executed_block_timestamp
            FROM multisig_pending
            WHERE executed = 1
              AND COALESCE(action, 'blacklist') = 'blacklist'
@@ -817,8 +955,8 @@ def _build_report(
         addr = row["target_address"] or ""
         submitted = row["submission_block_timestamp"]
         bl = blacklist_confirm.get((addr, chain))
-        confirmed = None
-        if bl and (bl["status"] or "") == "confirmed":
+        confirmed = row["executed_block_timestamp"]
+        if confirmed is None and bl and (bl["status"] or "") == "confirmed":
             confirmed = bl["confirmed_block_timestamp"]
         if confirmed is None:
             confirmed = _ms_from_iso(row["executed_at"])
@@ -983,7 +1121,8 @@ def _build_report(
         if row["tx_hash"]:
             our_hashes.add(_norm_hash(row["tx_hash"]))
     for row in _query(
-        bot, "SELECT target_address, chain, submission_tx_hash FROM multisig_pending"
+        bot,
+        "SELECT target_address, chain, submission_tx_hash FROM multisig_pending WHERE token = 'USDT'",
     ):
         our_addr_keys.add(
             ((row["chain"] or "TRON").upper(), _norm_addr(row["target_address"]))
@@ -1018,7 +1157,7 @@ def _build_report(
         """SELECT chain, target_address, submission_tx_hash, submission_block_timestamp, tx_id
            FROM multisig_pending
            WHERE COALESCE(action, 'blacklist') = 'blacklist'
-             AND submission_block_timestamp IS NOT NULL""",
+             AND submission_block_timestamp IS NOT NULL AND token = 'USDT'""",
     ):
         chain = (row["chain"] or "TRON").upper()
         if chain not in ("ETH", "TRON"):
@@ -1202,6 +1341,8 @@ def _build_report(
             ),
             "query_errors": list(_query_errors),
             "summary_sheet": SUMMARY_SHEET_ID,
+            "summary_source": summary_source,
+            "onchain_source": onchain_source,
             "onchain_sheet": ONCHAIN_SHEET_ID,
             "summary_error": summary_err,
             "onchain_error": onchain_err,

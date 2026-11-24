@@ -1,16 +1,16 @@
 from typing import Optional
 
 
-def format_usdt_balance(balance: Optional[float]) -> str:
+def format_usdt_balance(balance: Optional[float], token: str = "USDT") -> str:
     if balance is None:
         return "Unknown"
     if balance == 0:
-        return "0 USDT"
+        return f"0 {token}"
     if balance >= 1_000_000:
-        return f"{balance:,.0f} USDT"
+        return f"{balance:,.0f} {token}"
     if balance >= 1000:
-        return f"{balance:,.2f} USDT"
-    return f"{balance:.2f} USDT"
+        return f"{balance:,.2f} {token}"
+    return f"{balance:.2f} {token}"
 
 
 def format_elapsed_time(seconds: Optional[float]) -> str:

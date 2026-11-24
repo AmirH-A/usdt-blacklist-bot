@@ -188,6 +188,7 @@ def record_multisig_submission(
     action: str,
     block_timestamp: Optional[int],
     multisig_tx_id: Optional[int] = None,
+    token: str = "USDT",
 ) -> bool:
     """Persist a new MultiSig submission. Returns True if this row is new."""
     if not target_address or not tx_hash:
@@ -217,16 +218,16 @@ def record_multisig_submission(
         cursor.execute(
             f"""INSERT INTO multisig_pending
                (tx_id, chain, target_address, action, submission_tx_hash,
-                submitted_at, submission_block_timestamp, alerted)
-               VALUES (%s, %s, %s, %s, %s, {_NOW}, %s, 0)
+                submitted_at, submission_block_timestamp, alerted, token)
+               VALUES (%s, %s, %s, %s, %s, {_NOW}, %s, 0, %s)
                ON CONFLICT DO NOTHING""",
-            (multisig_tx_id, chain, target_address, action, tx_hash, block_timestamp),
+            (multisig_tx_id, chain, target_address, action, tx_hash, block_timestamp, token),
         )
         if cursor.rowcount == 0:
             conn.commit()
             return False
 
-        if action == "blacklist":
+        if action == "blacklist" and token == "USDT":
             cursor.execute(
                 "SELECT status FROM blacklist WHERE address = %s AND chain = %s",
                 (target_address, chain),
@@ -301,7 +302,7 @@ def reap_phantom_submissions(chain: str, max_age_s: int) -> list:
     cursor = conn.cursor()
     try:
         cursor.execute(
-            """SELECT tx_id, target_address, action, submission_tx_hash
+            """SELECT tx_id, target_address, action, submission_tx_hash, token
                FROM multisig_pending
                WHERE chain = %s
                  AND executed = 0
@@ -310,7 +311,7 @@ def reap_phantom_submissions(chain: str, max_age_s: int) -> list:
             (chain, cutoff),
         )
         rows = [
-            {"tx_id": r[0], "target_address": r[1], "action": r[2], "tx_hash": r[3]}
+            {"tx_id": r[0], "target_address": r[1], "action": r[2], "tx_hash": r[3], "token": r[4]}
             for r in cursor.fetchall()
         ]
         for r in rows:
@@ -318,6 +319,8 @@ def reap_phantom_submissions(chain: str, max_age_s: int) -> list:
                 "DELETE FROM multisig_pending WHERE tx_id = %s AND chain = %s",
                 (r["tx_id"], chain),
             )
+            if r["token"] != "USDT":
+                continue  # never wrote a blacklist row
             # Only remove the blacklist row if it is still unconfirmed. If the
             # block watcher confirmed it by another tx hash, leave it alone.
             cursor.execute(
@@ -345,7 +348,7 @@ def mark_multisig_executed(
         row = None
         if exec_tx_id is not None:
             cursor.execute(
-                """SELECT target_address, action, submission_tx_hash, submission_block_timestamp
+                """SELECT target_address, action, submission_tx_hash, submission_block_timestamp, token
                    FROM multisig_pending
                    WHERE tx_id = %s AND chain = %s AND executed = 0""",
                 (exec_tx_id, chain),
@@ -354,7 +357,7 @@ def mark_multisig_executed(
 
         if not row and target_address:
             cursor.execute(
-                """SELECT target_address, action, submission_tx_hash, submission_block_timestamp, tx_id
+                """SELECT target_address, action, submission_tx_hash, submission_block_timestamp, token, tx_id
                    FROM multisig_pending
                    WHERE target_address = %s AND chain = %s AND executed = 0
                    ORDER BY submitted_at DESC LIMIT 1""",
@@ -362,12 +365,12 @@ def mark_multisig_executed(
             )
             row = cursor.fetchone()
             if row:
-                exec_tx_id = row[4]
+                exec_tx_id = row[5]
 
         if not row:
             return None
 
-        target_address, action, submission_tx_hash, submitted_ts = row[:4]
+        target_address, action, submission_tx_hash, submitted_ts, token = row[:5]
         cursor.execute(
             "ALTER TABLE multisig_pending ADD COLUMN IF NOT EXISTS executed_block_timestamp BIGINT"
         )
@@ -380,19 +383,20 @@ def mark_multisig_executed(
         )
 
         new_status = "confirmed" if action == "blacklist" else "unfrozen"
-        cursor.execute(
-            f"""UPDATE blacklist
-               SET status = %s, confirmed_at = {_NOW}, tx_hash = %s,
-                   alerted = 1, confirmed_block_timestamp = %s
-               WHERE address = %s AND chain = %s""",
-            (
-                new_status,
-                exec_tx_hash or submission_tx_hash,
-                confirmed_block_timestamp,
-                target_address,
-                chain,
-            ),
-        )
+        if token == "USDT":  # XAUt has no blacklist row; see schema.sql
+            cursor.execute(
+                f"""UPDATE blacklist
+                   SET status = %s, confirmed_at = {_NOW}, tx_hash = %s,
+                       alerted = 1, confirmed_block_timestamp = %s
+                   WHERE address = %s AND chain = %s""",
+                (
+                    new_status,
+                    exec_tx_hash or submission_tx_hash,
+                    confirmed_block_timestamp,
+                    target_address,
+                    chain,
+                ),
+            )
         conn.commit()
         return {
             "target_address": target_address,
@@ -400,6 +404,7 @@ def mark_multisig_executed(
             "tx_hash": exec_tx_hash or submission_tx_hash,
             "submitted_ts": submitted_ts,
             "confirmed_block_timestamp": confirmed_block_timestamp,
+            "token": token,
         }
     finally:
         conn.close()
